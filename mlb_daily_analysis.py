@@ -655,13 +655,13 @@ def analyze_date(date_str, min_bvp_ab=8, recent_days=15, delay=0.15, use_statcas
         games = [g for g in games if g.get("status") == "Final"]
 
     if team_filter:
-        needle = team_filter.strip().lower()
+        needles = [n.strip().lower() for n in team_filter.split(",") if n.strip()]
         games = [
             g for g in games
-            if needle in g["home_team_name"].lower() or needle in g["away_team_name"].lower()
+            if any(n in g["home_team_name"].lower() or n in g["away_team_name"].lower() for n in needles)
         ]
         if not games:
-            log(f"No game found matching --team '{team_filter}' on {date_str}.")
+            log(f"No games found matching --team '{team_filter}' on {date_str}.")
             return [], []
 
     if use_statcast and not STATCAST_AVAILABLE:
@@ -801,8 +801,11 @@ if __name__ == "__main__":
     parser.add_argument("--similarity-threshold", type=float, default=0.85,
                          help="Cosine similarity (0-1) required to count a pitcher as 'similar' (default: 0.85)")
     parser.add_argument("--team", type=str, default=None,
-                         help="Scope to a single game by team name substring, e.g. --team Dodgers "
-                              "(matches home or away). Useful for fast test runs.")
+                         help="Scope to specific games by team name, comma-separated for multiple, "
+                              "e.g. --team Dodgers,Yankees,\"Red Sox\" (matches home or away, "
+                              "each match keeps that whole game -- so you'll get both teams' lineups "
+                              "for any game where either side matches). Useful for a targeted run "
+                              "instead of the full slate.")
     args = parser.parse_args()
 
     run(args.date, args.min_bvp_ab, args.recent_days, args.delay,
