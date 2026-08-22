@@ -1,0 +1,812 @@
+"""
+MLB Daily High-Probability Outcome Finder
+==========================================
+
+Scans all MLB games scheduled for a given day and ranks batters by their
+likelihood of recording a Hit, Run, or RBI, based on:
+
+  1. Historical batter-vs-pitcher (BvP) performance  <- weighted heaviest
+  2. Statcast pitcher-similarity performance -- when direct BvP sample is
+     too small, find pitchers with a similar Statcast arsenal (pitch mix,
+     velo, movement) that this batter HAS faced, and use his performance
+     against that similar-pitcher group as a proxy
+  3. Recent form (last N days of games)
+  4. Batter-vs-pitcher-hand splits (last-resort fallback if neither BvP
+     nor a Statcast-similar sample exists)
+  5. Lineup slot (used only to weight Runs vs RBI likelihood -- leadoff/
+     2-hole hitters score more runs, 3-4-5 hitters drive in more runs)
+
+Data sources:
+    - MLB Stats API (statsapi.mlb.com) -- free, no API key required.
+    - Baseball Savant Statcast data via the `pybaseball` package.
+
+USAGE:
+    python mlb_daily_analysis.py                     # today's games
+    python mlb_daily_analysis.py --date 2026-08-22
+    python mlb_daily_analysis.py --min-bvp-ab 8       # min ABs to trust BvP
+    python mlb_daily_analysis.py --no-statcast        # skip Statcast (faster)
+    python mlb_daily_analysis.py --similarity-threshold 0.9
+
+OUTPUT:
+    Prints a ranked report to the console and saves a CSV to
+    mlb_report_<date>.csv
+
+NOTE: This was written and reviewed without live network access. The MLB
+Stats API is undocumented/community-reverse-engineered, so if a call fails,
+check the printed error -- it will usually show the exact URL and response,
+which makes it easy to adjust a param name (see NOTES_ON_API_QUIRKS.md).
+pybaseball scrapes Baseball Savant, so Statcast calls are much slower than
+the MLB Stats API calls -- expect a full slate to take a while the first
+time (pybaseball's on-disk cache speeds up repeat runs significantly).
+"""
+
+import argparse
+import csv
+import math
+import sys
+import time
+from datetime import datetime, timedelta
+
+import requests
+
+try:
+    import pandas as pd
+    import pybaseball as pyb
+    pyb.cache.enable()  # cache Statcast pulls to disk between runs
+    STATCAST_AVAILABLE = True
+except ImportError:
+    STATCAST_AVAILABLE = False
+
+BASE = "https://statsapi.mlb.com/api/v1"
+BASE_V11 = "https://statsapi.mlb.com/api/v1.1"
+
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": "mlb-daily-analysis/1.0"})
+
+
+# ---------------------------------------------------------------------------
+# Low-level API helpers
+# ---------------------------------------------------------------------------
+
+def api_get(url, params=None, retries=2):
+    """GET with basic retry + error surfacing."""
+    for attempt in range(retries + 1):
+        try:
+            resp = SESSION.get(url, params=params, timeout=15)
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            if attempt == retries:
+                print(f"  [API ERROR] {url} params={params} -> {e}")
+                return None
+            time.sleep(0.5)
+
+
+# ---------------------------------------------------------------------------
+# Schedule / probable pitchers
+# ---------------------------------------------------------------------------
+
+def get_todays_games(date_str):
+    """Return list of dicts: gamePk, home/away team id+name, probable pitchers."""
+    data = api_get(
+        f"{BASE}/schedule",
+        params={
+            "sportId": 1,
+            "date": date_str,
+            "hydrate": "team,probablePitcher",
+        },
+    )
+    if not data:
+        return []
+
+    games = []
+    for date_block in data.get("dates", []):
+        for g in date_block.get("games", []):
+            teams = g.get("teams", {})
+            home = teams.get("home", {})
+            away = teams.get("away", {})
+            games.append({
+                "gamePk": g["gamePk"],
+                "status": g.get("status", {}).get("detailedState"),
+                "home_team_id": home.get("team", {}).get("id"),
+                "home_team_name": home.get("team", {}).get("name"),
+                "away_team_id": away.get("team", {}).get("id"),
+                "away_team_name": away.get("team", {}).get("name"),
+                "home_pitcher": home.get("probablePitcher", {}),
+                "away_pitcher": away.get("probablePitcher", {}),
+            })
+    return games
+
+
+# ---------------------------------------------------------------------------
+# Lineups
+# ---------------------------------------------------------------------------
+
+def get_live_lineup(game_pk, team_side):
+    """
+    Try to pull the actual posted lineup from the live game feed.
+    Only available once MLB posts lineups (~1-3 hrs before first pitch).
+    Returns list of (player_id, full_name, batting_order_slot) or [].
+    """
+    data = api_get(f"{BASE_V11}/game/{game_pk}/feed/live")
+    if not data:
+        return []
+    try:
+        team_box = data["liveData"]["boxscore"]["teams"][team_side]
+    except (KeyError, TypeError):
+        return []
+
+    order = team_box.get("battingOrder", [])
+    players = team_box.get("players", {})
+    lineup = []
+    for slot_idx, pid in enumerate(order):
+        p = players.get(f"ID{pid}", {})
+        person = p.get("person", {})
+        lineup.append((person.get("id"), person.get("fullName"), slot_idx + 1))
+    return lineup
+
+
+def get_fallback_lineup(team_id, before_date, num_games=5):
+    """
+    If no live lineup is posted yet, approximate the lineup using whichever
+    9 position players started most often for this team in their last
+    `num_games` games. Batting-order slot is approximated by average slot.
+    """
+    end = before_date
+    start = (datetime.strptime(before_date, "%Y-%m-%d") - timedelta(days=20)).strftime("%Y-%m-%d")
+
+    data = api_get(
+        f"{BASE}/schedule",
+        params={
+            "sportId": 1,
+            "teamId": team_id,
+            "startDate": start,
+            "endDate": end,
+            "hydrate": "game",
+        },
+    )
+    if not data:
+        return []
+
+    game_pks = []
+    for date_block in data.get("dates", []):
+        for g in date_block.get("games", []):
+            if g.get("status", {}).get("statusCode") == "F":  # Final games only
+                game_pks.append(g["gamePk"])
+    game_pks = game_pks[-num_games:]
+
+    appearances = {}  # player_id -> [name, [slots]]
+    for pk in game_pks:
+        boxscore = api_get(f"{BASE}/game/{pk}/boxscore")
+        if not boxscore:
+            continue
+        for side in ("home", "away"):
+            team_box = boxscore.get("teams", {}).get(side, {})
+            if team_box.get("team", {}).get("id") != team_id:
+                continue
+            order = team_box.get("battingOrder", [])
+            players = team_box.get("players", {})
+            for slot_idx, pid in enumerate(order):
+                p = players.get(f"ID{pid}", {})
+                person = p.get("person", {})
+                name = person.get("fullName")
+                appearances.setdefault(pid, [name, []])
+                appearances[pid][1].append(slot_idx + 1)
+
+    ranked = sorted(appearances.items(), key=lambda kv: -len(kv[1][1]))[:9]
+    lineup = []
+    for pid, (name, slots) in ranked:
+        avg_slot = sum(slots) / len(slots)
+        lineup.append((pid, name, round(avg_slot)))
+    lineup.sort(key=lambda x: x[2])
+    return lineup
+
+
+def get_lineup(game_pk, team_side, team_id, date_str):
+    lineup = get_live_lineup(game_pk, team_side)
+    if lineup:
+        return lineup, "posted"
+    return get_fallback_lineup(team_id, date_str), "estimated (recent starters)"
+
+
+# ---------------------------------------------------------------------------
+# Batter recent form
+# ---------------------------------------------------------------------------
+
+def get_recent_form(batter_id, end_date, days=15):
+    """Hitting stats over the trailing `days` window."""
+    start_date = (datetime.strptime(end_date, "%Y-%m-%d") - timedelta(days=days)).strftime("%Y-%m-%d")
+    data = api_get(
+        f"{BASE}/people/{batter_id}/stats",
+        params={
+            "stats": "byDateRange",
+            "startDate": start_date,
+            "endDate": end_date,
+            "group": "hitting",
+            "sportId": 1,
+        },
+    )
+    return _extract_hitting_split(data)
+
+
+# ---------------------------------------------------------------------------
+# Batter vs Pitcher (BvP)
+# ---------------------------------------------------------------------------
+
+def get_bvp(batter_id, pitcher_id, seasons=None):
+    """
+    Career batter-vs-this-pitcher line.
+
+    If `seasons` is given (list of ints), only sums data from those specific
+    seasons instead of the live "as of now" career total. This is what makes
+    backtesting leak-free: pass seasons strictly before the backtest date's
+    year and the result can't contain any at-bat that happened after the
+    date being tested.
+    """
+    if seasons:
+        splits = []
+        for season in seasons:
+            data = api_get(
+                f"{BASE}/people/{batter_id}/stats",
+                params={
+                    "stats": "vsPlayer",
+                    "opposingPlayerId": pitcher_id,
+                    "group": "hitting",
+                    "sportId": 1,
+                    "season": season,
+                },
+            )
+            s = _extract_hitting_split(data)
+            if s:
+                splits.append(s)
+        return _sum_hitting_splits(splits)
+
+    data = api_get(
+        f"{BASE}/people/{batter_id}/stats",
+        params={
+            "stats": "vsPlayer",
+            "opposingPlayerId": pitcher_id,
+            "group": "hitting",
+            "sportId": 1,
+        },
+    )
+    return _extract_hitting_split(data)
+
+
+def get_vs_hand_split(batter_id, pitcher_hand, seasons=None):
+    """
+    Proxy for 'vs similar pitcher': batter's career line vs all pitchers
+    of the same throwing hand (L or R). Used as a fallback when the direct
+    BvP sample is too small to trust. `seasons` works the same as in
+    get_bvp() -- pass prior seasons only for a leak-free backtest.
+    """
+    sit_code = "vl" if pitcher_hand == "L" else "vr"
+
+    if seasons:
+        splits = []
+        for season in seasons:
+            data = api_get(
+                f"{BASE}/people/{batter_id}/stats",
+                params={
+                    "stats": "statSplits",
+                    "sitCodes": sit_code,
+                    "group": "hitting",
+                    "sportId": 1,
+                    "season": season,
+                },
+            )
+            s = _extract_hitting_split(data)
+            if s:
+                splits.append(s)
+        return _sum_hitting_splits(splits)
+
+    data = api_get(
+        f"{BASE}/people/{batter_id}/stats",
+        params={
+            "stats": "statSplits",
+            "sitCodes": sit_code,
+            "group": "hitting",
+            "sportId": 1,
+        },
+    )
+    return _extract_hitting_split(data)
+
+
+def _sum_hitting_splits(splits):
+    """Combine multiple season-level hitting splits into one aggregate dict."""
+    if not splits:
+        return None
+    ab = sum(s["ab"] for s in splits)
+    h = sum(s["h"] for s in splits)
+    rbi = sum(s["rbi"] for s in splits)
+    runs = sum(s["runs"] for s in splits)
+    games = sum(s["games"] for s in splits)
+    return {
+        "ab": ab,
+        "h": h,
+        "avg": round(h / ab, 3) if ab else 0.0,
+        "obp": None,   # not meaningfully summable without PA/BB counts; unused downstream
+        "slg": None,
+        "rbi": rbi,
+        "runs": runs,
+        "games": games,
+    }
+
+
+def _extract_hitting_split(data):
+    """Pull AB/H/AVG/OBP/SLG out of a stats API response; returns dict or None."""
+    if not data:
+        return None
+    try:
+        splits = data["stats"][0]["splits"]
+        if not splits:
+            return None
+        stat = splits[0]["stat"]
+        return {
+            "ab": int(stat.get("atBats", 0) or 0),
+            "h": int(stat.get("hits", 0) or 0),
+            "avg": float(stat.get("avg", 0) or 0),
+            "obp": float(stat.get("obp", 0) or 0),
+            "slg": float(stat.get("slg", 0) or 0),
+            "rbi": int(stat.get("rbi", 0) or 0),
+            "runs": int(stat.get("runs", 0) or 0),
+            "games": int(stat.get("gamesPlayed", 0) or 0),
+        }
+    except (KeyError, IndexError, TypeError, ValueError):
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Statcast pitcher-similarity engine
+# ---------------------------------------------------------------------------
+#
+# Approach:
+#   1. Pull the target (today's opposing) pitcher's own Statcast pitch log
+#      for the lookback window -> build his arsenal profile (pitch-type
+#      usage %, velo, horizontal/vertical movement).
+#   2. Pull the batter's own Statcast pitch log for the same window. This
+#      contains every pitch he's seen, tagged with which pitcher threw it.
+#      Group by opposing pitcher -> build a profile for each pitcher the
+#      batter has actually faced, using the pitches thrown to him (a
+#      reasonable proxy for that pitcher's arsenal, though the sample per
+#      individual matchup can be small).
+#   3. Score cosine similarity between each faced-pitcher's profile and the
+#      target profile. Keep the ones above `similarity_threshold`,
+#      excluding the target pitcher himself (he's already covered by
+#      direct BvP).
+#   4. Aggregate the batter's real outcomes (AB/H/BB/etc.) across all plate
+#      appearances against that similar-pitcher group.
+#
+# Pitch buckets (collapses ~15 raw Statcast pitch_type codes into 3 groups
+# so the similarity comparison isn't overly sensitive to classifier noise):
+PITCH_BUCKETS = {
+    "FB": {"FF", "FT", "FC", "SI"},                    # fastballs/sinkers/cutters
+    "BR": {"SL", "CU", "KC", "ST", "SV", "CS"},         # breaking balls
+    "OS": {"CH", "FS", "FO", "SC", "KN"},               # offspeed
+}
+STATCAST_HIT_EVENTS = {"single", "double", "triple", "home_run"}
+STATCAST_AB_EXCLUDE_EVENTS = {
+    "walk", "hit_by_pitch", "sac_bunt", "sac_fly", "sac_fly_double_play",
+    "catcher_interf", "intent_walk", "batter_interference",
+}
+
+_arsenal_cache = {}
+_batter_history_cache = {}
+
+
+def _bucket_for_pitch(pitch_type):
+    for bucket, codes in PITCH_BUCKETS.items():
+        if pitch_type in codes:
+            return bucket
+    return None
+
+
+def build_arsenal_profile(pitch_df):
+    """
+    Given a Statcast pitch-level dataframe (must have pitch_type,
+    release_speed, pfx_x, pfx_z columns), return a 9-dim feature vector:
+    [FB_usage, FB_velo, FB_break, BR_usage, BR_velo, BR_break,
+     OS_usage, OS_velo, OS_break]
+    Velo/break components are scaled down by sqrt(usage) so rarely-used
+    pitch types contribute little noise to the similarity comparison.
+    """
+    if pitch_df is None or pitch_df.empty:
+        return None
+
+    df = pitch_df.copy()
+    df["bucket"] = df["pitch_type"].apply(_bucket_for_pitch)
+    df = df.dropna(subset=["bucket"])
+    total = len(df)
+    if total == 0:
+        return None
+
+    vec = []
+    for bucket in ("FB", "BR", "OS"):
+        sub = df[df["bucket"] == bucket]
+        usage = len(sub) / total
+        if len(sub) > 0:
+            velo = sub["release_speed"].mean(skipna=True) or 0.0
+            break_mag = (sub["pfx_x"].abs().mean(skipna=True) or 0.0) + \
+                        (sub["pfx_z"].abs().mean(skipna=True) or 0.0)
+        else:
+            velo, break_mag = 0.0, 0.0
+        weight = math.sqrt(usage)
+        vec.extend([usage, (velo / 100.0) * weight, (break_mag / 4.0) * weight])
+    return vec
+
+
+def cosine_similarity(a, b):
+    if not a or not b:
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = math.sqrt(sum(x * x for x in a))
+    norm_b = math.sqrt(sum(y * y for y in b))
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
+def get_pitcher_target_profile(pitcher_id, start_date, end_date):
+    """Target pitcher's own arsenal, pulled directly from his Statcast log."""
+    key = (pitcher_id, start_date, end_date)
+    if key in _arsenal_cache:
+        return _arsenal_cache[key]
+    if not STATCAST_AVAILABLE:
+        return None
+    try:
+        df = pyb.statcast_pitcher(start_date, end_date, pitcher_id)
+    except Exception as e:
+        print(f"  [Statcast ERROR] pitcher {pitcher_id}: {e}")
+        df = None
+    profile = build_arsenal_profile(df)
+    _arsenal_cache[key] = profile
+    return profile
+
+
+def get_batter_statcast_history(batter_id, start_date, end_date):
+    """Batter's full pitch-level Statcast log for the window. Cached per batter."""
+    key = (batter_id, start_date, end_date)
+    if key in _batter_history_cache:
+        return _batter_history_cache[key]
+    if not STATCAST_AVAILABLE:
+        return None
+    try:
+        df = pyb.statcast_batter(start_date, end_date, batter_id)
+    except Exception as e:
+        print(f"  [Statcast ERROR] batter {batter_id}: {e}")
+        df = None
+    _batter_history_cache[key] = df
+    return df
+
+
+def get_similar_pitcher_stats(batter_id, target_pitcher_id, target_profile,
+                               start_date, end_date, similarity_threshold=0.85):
+    """
+    Returns dict {ab, h, avg, n_similar_pitchers, similar_names} summarizing
+    the batter's real outcomes against pitchers whose Statcast arsenal is
+    similar to the target pitcher's, excluding the target pitcher himself.
+    Returns None if Statcast data/pybaseball isn't available or usable.
+    """
+    if not STATCAST_AVAILABLE or target_profile is None:
+        return None
+
+    hist = get_batter_statcast_history(batter_id, start_date, end_date)
+    if hist is None or hist.empty or "pitcher" not in hist.columns:
+        return None
+
+    similar_pitcher_ids = []
+    for pid, group in hist.groupby("pitcher"):
+        if pid == target_pitcher_id:
+            continue
+        profile = build_arsenal_profile(group)
+        sim = cosine_similarity(profile, target_profile)
+        if sim >= similarity_threshold:
+            similar_pitcher_ids.append(pid)
+
+    if not similar_pitcher_ids:
+        return None
+
+    # Aggregate real plate-appearance outcomes against those pitchers.
+    pa_rows = hist[hist["pitcher"].isin(similar_pitcher_ids) & hist["events"].notna()]
+    if pa_rows.empty:
+        return None
+
+    ab = int((~pa_rows["events"].isin(STATCAST_AB_EXCLUDE_EVENTS)).sum())
+    h = int(pa_rows["events"].isin(STATCAST_HIT_EVENTS).sum())
+    avg = round(h / ab, 3) if ab > 0 else 0.0
+
+    return {
+        "ab": ab,
+        "h": h,
+        "avg": avg,
+        "n_similar_pitchers": len(similar_pitcher_ids),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Scoring
+# ---------------------------------------------------------------------------
+
+def score_batter(bvp, statcast_similar, hand_split, recent, lineup_slot, min_bvp_ab=8):
+    """
+    Returns dict with hit_score, run_score, rbi_score (0-100 scale, roughly)
+    plus a note on which data the score leaned on.
+
+    Weighting (per user preference: BvP > recent form), in priority order:
+        1. BvP sample >= min_bvp_ab:
+               65% BvP, 35% recent
+        2. Statcast-similar-pitcher sample >= min_bvp_ab (pitchers with a
+           matching arsenal that this batter has actually faced):
+               50% Statcast-similar, 30% recent, 20% BvP (whatever exists)
+        3. Hand-split sample >= min_bvp_ab (last resort proxy):
+               45% hand-split, 30% recent, 25% BvP (whatever exists)
+        4. Recent form only, flagged as low-confidence.
+    """
+    def pct(x):
+        return max(0.0, min(1.0, x)) * 100
+
+    recent_avg = recent["avg"] if recent else 0.0
+    recent_hit_rate = (recent["h"] / recent["games"]) if recent and recent.get("games") else 0.0
+    bvp_avg = bvp["avg"] if bvp else 0.0
+
+    note = ""
+    if bvp and bvp["ab"] >= min_bvp_ab:
+        hit_component = 0.65 * bvp["avg"] + 0.35 * recent_avg
+        note = f"BvP sample trusted ({bvp['ab']} AB, {bvp['avg']:.3f})"
+    elif statcast_similar and statcast_similar["ab"] >= min_bvp_ab:
+        hit_component = 0.50 * statcast_similar["avg"] + 0.30 * recent_avg + 0.20 * bvp_avg
+        note = (f"BvP too small ({bvp['ab'] if bvp else 0} AB) -- used Statcast-similar-arsenal "
+                f"pitchers ({statcast_similar['n_similar_pitchers']} pitchers, "
+                f"{statcast_similar['ab']} AB, {statcast_similar['avg']:.3f})")
+    elif hand_split and hand_split["ab"] >= min_bvp_ab:
+        hit_component = 0.45 * hand_split["avg"] + 0.30 * recent_avg + 0.25 * bvp_avg
+        note = f"BvP/Statcast-similar too small -- used vs-hand split ({hand_split['ab']} AB, {hand_split['avg']:.3f}) as proxy"
+    else:
+        hit_component = recent_avg
+        note = "No usable BvP, Statcast-similar, or hand-split sample -- recent form only"
+
+    hit_score = pct(hit_component)
+
+    # Runs/RBI: blend the hit likelihood with lineup-slot tendency.
+    # Slots 1-2 -> runs bias; slots 3-5 -> RBI bias; 6-9 -> both discounted.
+    if lineup_slot in (1, 2):
+        run_bias, rbi_bias = 1.15, 0.85
+    elif lineup_slot in (3, 4, 5):
+        run_bias, rbi_bias = 0.90, 1.20
+    elif lineup_slot:
+        run_bias, rbi_bias = 0.80, 0.80
+    else:
+        run_bias, rbi_bias = 1.0, 1.0
+
+    run_score = pct((hit_component * 0.6 + recent_hit_rate * 0.4) * run_bias)
+    rbi_score = pct((hit_component * 0.6 + recent_hit_rate * 0.4) * rbi_bias)
+
+    return {
+        "hit_score": round(hit_score, 1),
+        "run_score": round(run_score, 1),
+        "rbi_score": round(rbi_score, 1),
+        "note": note,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Actual results (for backtesting)
+# ---------------------------------------------------------------------------
+
+def get_game_batting_actuals(game_pk):
+    """
+    For a completed game, return {player_id: {h, r, rbi, ab}} of what each
+    batter actually did in that game. Used to score backtest predictions
+    against reality.
+    """
+    boxscore = api_get(f"{BASE}/game/{game_pk}/boxscore")
+    if not boxscore:
+        return {}
+    actuals = {}
+    for side in ("home", "away"):
+        team_box = boxscore.get("teams", {}).get(side, {})
+        players = team_box.get("players", {})
+        for key, p in players.items():
+            person = p.get("person", {})
+            pid = person.get("id")
+            batting = p.get("stats", {}).get("batting", {})
+            if not pid or not batting:
+                continue
+            actuals[pid] = {
+                "ab": int(batting.get("atBats", 0) or 0),
+                "h": int(batting.get("hits", 0) or 0),
+                "r": int(batting.get("runs", 0) or 0),
+                "rbi": int(batting.get("rbi", 0) or 0),
+            }
+    return actuals
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def analyze_date(date_str, min_bvp_ab=8, recent_days=15, delay=0.15, use_statcast=True,
+                  statcast_lookback_days=395, similarity_threshold=0.85, team_filter=None,
+                  bvp_seasons=None, final_games_only=False, verbose=True):
+    """
+    Core analysis engine, reusable by both the live CLI (run()) and
+    backtest.py. Returns (rows, games) where rows is the list of per-batter
+    prediction dicts and games is the list of games actually analyzed.
+
+    `bvp_seasons`: if given (list of ints), BvP and hand-split lookups are
+    restricted to those seasons only -- pass seasons strictly before the
+    date being analyzed to guarantee a leak-free backtest. Leave as None
+    for live/current use (uses full career-to-date).
+
+    `final_games_only`: if True, skips any game that isn't status "Final" --
+    used by the backtester so it only scores games with real results.
+    """
+    def log(msg):
+        if verbose:
+            print(msg)
+
+    log(f"Fetching MLB schedule for {date_str}...")
+    games = get_todays_games(date_str)
+    if not games:
+        log("No games found (or API call failed).")
+        return [], []
+
+    if final_games_only:
+        games = [g for g in games if g.get("status") == "Final"]
+
+    if team_filter:
+        needle = team_filter.strip().lower()
+        games = [
+            g for g in games
+            if needle in g["home_team_name"].lower() or needle in g["away_team_name"].lower()
+        ]
+        if not games:
+            log(f"No game found matching --team '{team_filter}' on {date_str}.")
+            return [], []
+
+    if use_statcast and not STATCAST_AVAILABLE:
+        log("pybaseball is not installed -- Statcast similarity will be skipped.")
+        use_statcast = False
+
+    statcast_start = (datetime.strptime(date_str, "%Y-%m-%d") - timedelta(days=statcast_lookback_days)).strftime("%Y-%m-%d")
+    statcast_end = (datetime.strptime(date_str, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")  # no same-day leakage
+
+    log(f"Found {len(games)} game(s) to analyze for {date_str}.\n")
+    rows = []
+
+    for g in games:
+        matchups = [
+            ("away", g["away_team_id"], g["away_team_name"], g["home_pitcher"]),
+            ("home", g["home_team_id"], g["home_team_name"], g["away_pitcher"]),
+        ]
+        for side, team_id, team_name, opp_pitcher in matchups:
+            pitcher_id = opp_pitcher.get("id")
+            pitcher_name = opp_pitcher.get("fullName", "TBD")
+            if not pitcher_id:
+                log(f"  Skipping {team_name}: no probable/starting pitcher on record.")
+                continue
+
+            pitcher_info = api_get(f"{BASE}/people/{pitcher_id}")
+            pitcher_hand = "R"
+            if pitcher_info:
+                try:
+                    pitcher_hand = pitcher_info["people"][0]["pitchHand"]["code"]
+                except (KeyError, IndexError, TypeError):
+                    pass
+
+            lineup, lineup_source = get_lineup(g["gamePk"], side, team_id, date_str)
+            log(f"{team_name} vs {pitcher_name} ({pitcher_hand}HP) -- lineup: {lineup_source}, {len(lineup)} batters")
+
+            target_profile = None
+            if use_statcast:
+                target_profile = get_pitcher_target_profile(pitcher_id, statcast_start, statcast_end)
+                if target_profile is None:
+                    log(f"  [warn] No usable Statcast profile for {pitcher_name} -- falling back to hand-split only.")
+
+            for pid, name, slot in lineup:
+                if not pid:
+                    continue
+                bvp = get_bvp(pid, pitcher_id, seasons=bvp_seasons)
+                hand_split = get_vs_hand_split(pid, pitcher_hand, seasons=bvp_seasons)
+                recent = get_recent_form(pid, date_str, days=recent_days)
+
+                statcast_similar = None
+                if use_statcast and target_profile is not None and (not bvp or bvp["ab"] < min_bvp_ab):
+                    statcast_similar = get_similar_pitcher_stats(
+                        pid, pitcher_id, target_profile, statcast_start, statcast_end,
+                        similarity_threshold=similarity_threshold,
+                    )
+
+                scores = score_batter(bvp, statcast_similar, hand_split, recent, slot, min_bvp_ab)
+
+                rows.append({
+                    "date": date_str,
+                    "gamePk": g["gamePk"],
+                    "game": f"{g['away_team_name']} @ {g['home_team_name']}",
+                    "batter_id": pid,
+                    "batter": name,
+                    "team": team_name,
+                    "lineup_slot": slot,
+                    "opp_pitcher": pitcher_name,
+                    "pitcher_hand": pitcher_hand,
+                    "bvp_ab": bvp["ab"] if bvp else 0,
+                    "bvp_avg": bvp["avg"] if bvp else None,
+                    "statcast_similar_ab": statcast_similar["ab"] if statcast_similar else None,
+                    "statcast_similar_avg": statcast_similar["avg"] if statcast_similar else None,
+                    "statcast_n_similar_pitchers": statcast_similar["n_similar_pitchers"] if statcast_similar else None,
+                    "recent_avg": recent["avg"] if recent else None,
+                    "hit_score": scores["hit_score"],
+                    "run_score": scores["run_score"],
+                    "rbi_score": scores["rbi_score"],
+                    "note": scores["note"],
+                })
+                time.sleep(delay)  # be polite to the MLB Stats API
+
+    return rows, games
+
+
+def run(date_str, min_bvp_ab, recent_days, delay, use_statcast, statcast_lookback_days,
+        similarity_threshold, team_filter=None):
+    rows, games = analyze_date(
+        date_str, min_bvp_ab=min_bvp_ab, recent_days=recent_days, delay=delay,
+        use_statcast=use_statcast, statcast_lookback_days=statcast_lookback_days,
+        similarity_threshold=similarity_threshold, team_filter=team_filter,
+    )
+
+    if not rows:
+        print("No batters processed -- lineups may not be posted yet for this date.")
+        return
+
+    # --- Reports ---
+    print("\n" + "=" * 70)
+    print("TOP 15 HIT PROBABILITY")
+    print("=" * 70)
+    for r in sorted(rows, key=lambda x: -x["hit_score"])[:15]:
+        print(f"{r['hit_score']:>5} | {r['batter']:<22} ({r['team']}) vs {r['opp_pitcher']:<18} | {r['note']}")
+
+    print("\n" + "=" * 70)
+    print("TOP 15 RUN PROBABILITY")
+    print("=" * 70)
+    for r in sorted(rows, key=lambda x: -x["run_score"])[:15]:
+        print(f"{r['run_score']:>5} | {r['batter']:<22} ({r['team']}) slot {r['lineup_slot']}")
+
+    print("\n" + "=" * 70)
+    print("TOP 15 RBI PROBABILITY")
+    print("=" * 70)
+    for r in sorted(rows, key=lambda x: -x["rbi_score"])[:15]:
+        print(f"{r['rbi_score']:>5} | {r['batter']:<22} ({r['team']}) slot {r['lineup_slot']}")
+
+    out_path = f"mlb_report_{date_str}.csv"
+    with open(out_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"\nFull report saved to {out_path}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="MLB daily high-probability outcome finder")
+    parser.add_argument("--date", default=datetime.now().strftime("%Y-%m-%d"),
+                         help="Date to analyze, YYYY-MM-DD (default: today)")
+    parser.add_argument("--min-bvp-ab", type=int, default=8,
+                         help="Minimum at-bats vs a pitcher before trusting the BvP sample (default: 8)")
+    parser.add_argument("--recent-days", type=int, default=15,
+                         help="Trailing window for 'recent form' (default: 15 days)")
+    parser.add_argument("--delay", type=float, default=0.15,
+                         help="Seconds to sleep between API calls, be polite (default: 0.15)")
+    parser.add_argument("--no-statcast", action="store_true",
+                         help="Skip Statcast pitcher-similarity analysis (much faster, uses hand-split fallback only)")
+    parser.add_argument("--statcast-lookback-days", type=int, default=395,
+                         help="How far back to pull Statcast data for arsenal/history building (default: 395, ~current + prior season)")
+    parser.add_argument("--similarity-threshold", type=float, default=0.85,
+                         help="Cosine similarity (0-1) required to count a pitcher as 'similar' (default: 0.85)")
+    parser.add_argument("--team", type=str, default=None,
+                         help="Scope to a single game by team name substring, e.g. --team Dodgers "
+                              "(matches home or away). Useful for fast test runs.")
+    args = parser.parse_args()
+
+    run(args.date, args.min_bvp_ab, args.recent_days, args.delay,
+        use_statcast=not args.no_statcast,
+        statcast_lookback_days=args.statcast_lookback_days,
+        similarity_threshold=args.similarity_threshold,
+        team_filter=args.team)
