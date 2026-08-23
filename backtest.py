@@ -9,9 +9,16 @@ For each date in a range, this:
   3. Joins predictions to actuals and reports:
        - Top-decile hit rate: of the batters the model ranked in the top
          10% of hit_score each day, what fraction actually got a hit? Same
-         for run_score/RBI. Compared against the baseline (all-batter) rate.
-       - Correlation: Pearson correlation between each score and the actual
-         binary outcome, across every batter-game in the window.
+         for run_score/rbi_score. Compared against the baseline (all-batter)
+         rate.
+       - Correlation: Pearson correlation between each 0-100 score and the
+         actual binary outcome, across every batter-game in the window.
+       - Combined projection accuracy: correlation AND mean absolute error
+         (MAE) between expected_combined (the projected Hits+Runs+RBIs
+         count -- see mlb_daily_analysis.py) and the batter's actual
+         combined count that game. This is the metric that matters most for
+         validating the "H+R+RBI" prop-style projection specifically, since
+         it's a continuous count, not a hit/miss score.
 
 LEAKAGE CONTROL (important):
     Recent form and Statcast are naturally date-bounded already (they only
@@ -31,11 +38,11 @@ LEAKAGE CONTROL (important):
 USAGE:
     python backtest.py --start-date 2026-08-01 --end-date 2026-08-14
     python backtest.py --start-date 2026-08-01 --end-date 2026-08-14 --no-statcast
-    python backtest.py --start-date 2026-08-01 --end-date 2026-08-14 --team Dodgers
+    python backtest.py --start-date 2026-08-01 --end-date 2026-08-14 --team "Dodgers,Yankees"
 
 OUTPUT:
     backtest_<start>_<end>.csv       -- every batter-game: prediction + actual
-    Console summary with hit-rate and correlation metrics
+    Console summary with hit-rate, correlation, and combined-projection MAE
 """
 
 import argparse
@@ -67,6 +74,13 @@ def pearson_corr(xs, ys):
     if var_x == 0 or var_y == 0:
         return None
     return cov / math.sqrt(var_x * var_y)
+
+
+def mean_absolute_error(xs, ys):
+    n = len(xs)
+    if n == 0:
+        return None
+    return sum(abs(x - y) for x, y in zip(xs, ys)) / n
 
 
 def top_decile_hit_rate(rows, score_key, actual_key):
@@ -142,11 +156,15 @@ def run_backtest(start_date, end_date, use_statcast, min_bvp_ab, recent_days,
                 r["actual_h"] = None
                 r["actual_r"] = None
                 r["actual_rbi"] = None
+                r["actual_combined"] = None
+                r["actual_total_bases"] = None
             else:
                 r["actual_ab"] = a["ab"]
                 r["actual_h"] = a["h"]
                 r["actual_r"] = a["r"]
                 r["actual_rbi"] = a["rbi"]
+                r["actual_combined"] = a["h"] + a["r"] + a["rbi"]
+                r["actual_total_bases"] = a["tb"]
             all_rows.append(r)
 
     # Drop rows with no actual result (e.g. batter didn't end up playing)
@@ -188,6 +206,36 @@ def run_backtest(start_date, end_date, use_statcast, min_bvp_ab, recent_days,
             print(f"  Correlation (score vs actual outcome): {corr:.3f}")
         print()
 
+    def report_projection_block(label, proj_key, actual_key, event_label):
+        print(f"--- {label} ---")
+        top_rate, base_rate, n_top, n_base = top_decile_hit_rate(scored_rows, proj_key, actual_key)
+        if top_rate is not None and base_rate is not None:
+            lift = (top_rate / base_rate - 1) * 100 if base_rate > 0 else None
+            print(f"  Top-10% projected ({n_top} picks): {top_rate:.1%} recorded at least 1 {event_label}")
+            print(f"  Baseline (all {n_base} batters):    {base_rate:.1%}")
+            if lift is not None:
+                print(f"  Lift: {lift:+.1f}%")
+
+        proj = [r[proj_key] for r in scored_rows]
+        actual = [r[actual_key] for r in scored_rows]
+        corr = pearson_corr(proj, actual)
+        mae = mean_absolute_error(proj, actual)
+        avg_proj = sum(proj) / len(proj)
+        avg_actual = sum(actual) / len(actual)
+        if corr is not None:
+            print(f"  Correlation (projected vs actual count): {corr:.3f}")
+        if mae is not None:
+            print(f"  Mean absolute error: {mae:.2f}  (avg projected {avg_proj:.2f} vs avg actual {avg_actual:.2f})")
+        print()
+
+    # --- Combined projection (the real target: expected_combined ~ actual H+R+RBI count) ---
+    report_projection_block("COMBINED (projected H+R+RBI count vs actual)",
+                             "expected_combined", "actual_combined", "combined H/R/RBI event")
+
+    # --- Total Bases projection ---
+    report_projection_block("TOTAL BASES (projected vs actual)",
+                             "expected_total_bases", "actual_total_bases", "total base")
+
     print(f"Full batter-by-batter results saved to {out_path}")
 
 
@@ -203,7 +251,8 @@ if __name__ == "__main__":
     parser.add_argument("--statcast-lookback-days", type=int, default=395)
     parser.add_argument("--similarity-threshold", type=float, default=0.85)
     parser.add_argument("--team", type=str, default=None,
-                         help="Scope to one team's games each day, for a fast test run")
+                         help="Scope to specific teams each day, comma-separated for multiple, "
+                              "e.g. --team \"Dodgers,Yankees\". Useful for a fast test run.")
     args = parser.parse_args()
 
     run_backtest(

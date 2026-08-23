@@ -318,6 +318,7 @@ def _sum_hitting_splits(splits):
         return None
     ab = sum(s["ab"] for s in splits)
     h = sum(s["h"] for s in splits)
+    tb = sum(s["tb"] for s in splits)
     rbi = sum(s["rbi"] for s in splits)
     runs = sum(s["runs"] for s in splits)
     games = sum(s["games"] for s in splits)
@@ -326,7 +327,8 @@ def _sum_hitting_splits(splits):
         "h": h,
         "avg": round(h / ab, 3) if ab else 0.0,
         "obp": None,   # not meaningfully summable without PA/BB counts; unused downstream
-        "slg": None,
+        "tb": tb,
+        "slg": round(tb / ab, 3) if ab else 0.0,
         "rbi": rbi,
         "runs": runs,
         "games": games,
@@ -334,7 +336,7 @@ def _sum_hitting_splits(splits):
 
 
 def _extract_hitting_split(data):
-    """Pull AB/H/AVG/OBP/SLG out of a stats API response; returns dict or None."""
+    """Pull AB/H/AVG/OBP/SLG/TB out of a stats API response; returns dict or None."""
     if not data:
         return None
     try:
@@ -348,6 +350,7 @@ def _extract_hitting_split(data):
             "avg": float(stat.get("avg", 0) or 0),
             "obp": float(stat.get("obp", 0) or 0),
             "slg": float(stat.get("slg", 0) or 0),
+            "tb": int(stat.get("totalBases", 0) or 0),
             "rbi": int(stat.get("rbi", 0) or 0),
             "runs": int(stat.get("runs", 0) or 0),
             "games": int(stat.get("gamesPlayed", 0) or 0),
@@ -385,6 +388,7 @@ PITCH_BUCKETS = {
     "OS": {"CH", "FS", "FO", "SC", "KN"},               # offspeed
 }
 STATCAST_HIT_EVENTS = {"single", "double", "triple", "home_run"}
+TOTAL_BASE_VALUES = {"single": 1, "double": 2, "triple": 3, "home_run": 4}
 STATCAST_AB_EXCLUDE_EVENTS = {
     "walk", "hit_by_pitch", "sac_bunt", "sac_fly", "sac_fly_double_play",
     "catcher_interf", "intent_walk", "batter_interference",
@@ -482,7 +486,7 @@ def get_batter_statcast_history(batter_id, start_date, end_date):
 def get_similar_pitcher_stats(batter_id, target_pitcher_id, target_profile,
                                start_date, end_date, similarity_threshold=0.85):
     """
-    Returns dict {ab, h, avg, n_similar_pitchers, similar_names} summarizing
+    Returns dict {ab, h, avg, tb, slg, n_similar_pitchers} summarizing
     the batter's real outcomes against pitchers whose Statcast arsenal is
     similar to the target pitcher's, excluding the target pitcher himself.
     Returns None if Statcast data/pybaseball isn't available or usable.
@@ -514,11 +518,15 @@ def get_similar_pitcher_stats(batter_id, target_pitcher_id, target_profile,
     ab = int((~pa_rows["events"].isin(STATCAST_AB_EXCLUDE_EVENTS)).sum())
     h = int(pa_rows["events"].isin(STATCAST_HIT_EVENTS).sum())
     avg = round(h / ab, 3) if ab > 0 else 0.0
+    tb = int(pa_rows["events"].map(TOTAL_BASE_VALUES).fillna(0).sum())
+    slg = round(tb / ab, 3) if ab > 0 else 0.0
 
     return {
         "ab": ab,
         "h": h,
         "avg": avg,
+        "tb": tb,
+        "slg": slg,
         "n_similar_pitchers": len(similar_pitcher_ids),
     }
 
@@ -604,6 +612,20 @@ def score_batter(bvp, statcast_similar, hand_split, recent, lineup_slot, min_bvp
 
     hit_score = pct(hit_component)
 
+    # Slugging component (for Total Bases projection) -- same tiered priority
+    # as the hit-probability blend above, but tracking bases-per-AB (SLG)
+    # instead of hits-per-AB (AVG), so it credits doubles/triples/HRs properly.
+    recent_slg = recent["slg"] if recent else 0.0
+    bvp_slg = bvp["slg"] if bvp else 0.0
+    if bvp and bvp["ab"] >= min_bvp_ab:
+        slg_component = 0.65 * bvp["slg"] + 0.35 * recent_slg
+    elif statcast_similar and statcast_similar["ab"] >= min_bvp_ab:
+        slg_component = 0.50 * statcast_similar["slg"] + 0.30 * recent_slg + 0.20 * bvp_slg
+    elif hand_split and hand_split["ab"] >= min_bvp_ab:
+        slg_component = 0.45 * hand_split["slg"] + 0.30 * recent_slg + 0.25 * bvp_slg
+    else:
+        slg_component = recent_slg
+
     # Runs/RBI 0-100 scores: blend the hit likelihood with lineup-slot tendency.
     # Slots 1-2 -> runs bias; slots 3-5 -> RBI bias; 6-9 -> both discounted.
     if lineup_slot in (1, 2):
@@ -632,6 +654,7 @@ def score_batter(bvp, statcast_similar, hand_split, recent, lineup_slot, min_bvp
     expected_runs = round(_blend_rate(bvp, hand_split, recent, "runs", min_bvp_ab), 2)
     expected_rbi = round(_blend_rate(bvp, hand_split, recent, "rbi", min_bvp_ab), 2)
     expected_combined = round(expected_hits + expected_runs + expected_rbi, 2)
+    expected_total_bases = round(ab_per_game * slg_component, 2)
 
     return {
         "hit_score": hit_score,
@@ -642,6 +665,7 @@ def score_batter(bvp, statcast_similar, hand_split, recent, lineup_slot, min_bvp
         "expected_runs": expected_runs,
         "expected_rbi": expected_rbi,
         "expected_combined": expected_combined,
+        "expected_total_bases": expected_total_bases,
         "note": note,
     }
 
@@ -652,7 +676,7 @@ def score_batter(bvp, statcast_similar, hand_split, recent, lineup_slot, min_bvp
 
 def get_game_batting_actuals(game_pk):
     """
-    For a completed game, return {player_id: {h, r, rbi, ab}} of what each
+    For a completed game, return {player_id: {h, r, rbi, ab, tb}} of what each
     batter actually did in that game. Used to score backtest predictions
     against reality.
     """
@@ -674,6 +698,7 @@ def get_game_batting_actuals(game_pk):
                 "h": int(batting.get("hits", 0) or 0),
                 "r": int(batting.get("runs", 0) or 0),
                 "rbi": int(batting.get("rbi", 0) or 0),
+                "tb": int(batting.get("totalBases", 0) or 0),
             }
     return actuals
 
@@ -800,6 +825,7 @@ def analyze_date(date_str, min_bvp_ab=8, recent_days=15, delay=0.15, use_statcas
                     "expected_runs": scores["expected_runs"],
                     "expected_rbi": scores["expected_rbi"],
                     "expected_combined": scores["expected_combined"],
+                    "expected_total_bases": scores["expected_total_bases"],
                     "note": scores["note"],
                 })
                 time.sleep(delay)  # be polite to the MLB Stats API
@@ -843,6 +869,13 @@ def run(date_str, min_bvp_ab, recent_days, delay, use_statcast, statcast_lookbac
         rows, "expected_combined", "TOP 10 PROJECTED H+R+RBI (expected combined count)",
         extra_col=("  PROJ H/R/RBI",
                    lambda r: f"  {r['expected_hits']:.2f}/{r['expected_runs']:.2f}/{r['expected_rbi']:.2f}"),
+    )
+
+    # --- Total Bases: its own standalone prop, projected from slugging (not part
+    # of the H+R+RBI combined number above) ---
+    print_leaderboard(
+        rows, "expected_total_bases", "TOP 10 PROJECTED TOTAL BASES",
+        extra_col=("  NOTE", lambda r: f"  {r['note']}"),
     )
 
     # --- Individual category leaderboards ---
