@@ -527,10 +527,45 @@ def get_similar_pitcher_stats(batter_id, target_pitcher_id, target_profile,
 # Scoring
 # ---------------------------------------------------------------------------
 
+def _rate_per_game(split, key):
+    """Historical per-game rate for a counting stat (runs, rbi), or None if no games."""
+    if not split or not split.get("games"):
+        return None
+    return split[key] / split["games"]
+
+
+def _blend_rate(bvp, hand_split, recent, key, min_bvp_ab):
+    """
+    Same priority chain as the hit-probability blend (BvP > hand-split > recent),
+    but for a raw per-game counting rate (runs or rbi) instead of a batting average.
+    No Statcast-similar tier here -- the Statcast pitch log doesn't cleanly give us
+    runs/RBI per PA, so that tier is skipped for this metric (falls to hand-split).
+    """
+    bvp_rate = _rate_per_game(bvp, key)
+    hand_rate = _rate_per_game(hand_split, key)
+    recent_rate = _rate_per_game(recent, key) or 0.0
+
+    if bvp and bvp["ab"] >= min_bvp_ab and bvp_rate is not None:
+        return 0.65 * bvp_rate + 0.35 * recent_rate
+    elif hand_split and hand_split["ab"] >= min_bvp_ab and hand_rate is not None:
+        return 0.45 * hand_rate + 0.30 * recent_rate + 0.25 * (bvp_rate or 0.0)
+    else:
+        return recent_rate
+
+
 def score_batter(bvp, statcast_similar, hand_split, recent, lineup_slot, min_bvp_ab=8):
     """
-    Returns dict with hit_score, run_score, rbi_score (0-100 scale, roughly)
-    plus a note on which data the score leaned on.
+    Returns dict with two families of output:
+
+    1. hit_score / run_score / rbi_score (0-100): percentile-style "how good
+       does this matchup look" scores, ranked independently per category.
+    2. expected_hits / expected_runs / expected_rbi / expected_combined:
+       real projected COUNTS for tonight's game (e.g. 1.8), summed as
+       expected_combined -- this is what actually maps to a "Hits+Runs+RBIs"
+       betting prop line (usually offered as an over/under like 1.5 or 2.5),
+       since that prop is a literal sum of counts, not an average of
+       independent probabilities. A solo homer alone scores 3 on this
+       metric (1 hit + 1 run + 1 RBI) -- that's intentional.
 
     Weighting (per user preference: BvP > recent form), in priority order:
         1. BvP sample >= min_bvp_ab:
@@ -541,6 +576,8 @@ def score_batter(bvp, statcast_similar, hand_split, recent, lineup_slot, min_bvp
         3. Hand-split sample >= min_bvp_ab (last resort proxy):
                45% hand-split, 30% recent, 25% BvP (whatever exists)
         4. Recent form only, flagged as low-confidence.
+    (Expected-count runs/rbi rates use the same priority but skip the
+    Statcast tier -- see _blend_rate.)
     """
     def pct(x):
         return max(0.0, min(1.0, x)) * 100
@@ -567,7 +604,7 @@ def score_batter(bvp, statcast_similar, hand_split, recent, lineup_slot, min_bvp
 
     hit_score = pct(hit_component)
 
-    # Runs/RBI: blend the hit likelihood with lineup-slot tendency.
+    # Runs/RBI 0-100 scores: blend the hit likelihood with lineup-slot tendency.
     # Slots 1-2 -> runs bias; slots 3-5 -> RBI bias; 6-9 -> both discounted.
     if lineup_slot in (1, 2):
         run_bias, rbi_bias = 1.15, 0.85
@@ -586,11 +623,25 @@ def score_batter(bvp, statcast_similar, hand_split, recent, lineup_slot, min_bvp
     rbi_score = round(rbi_score, 1)
     combined_score = round((hit_score + run_score + rbi_score) / 3, 1)
 
+    # --- Real expected-count projections (the "Hits+Runs+RBIs" prop equivalent) ---
+    ab_per_game = 4.0  # league-average default
+    if recent and recent.get("games"):
+        ab_per_game = recent["ab"] / recent["games"]
+
+    expected_hits = round(ab_per_game * hit_component, 2)
+    expected_runs = round(_blend_rate(bvp, hand_split, recent, "runs", min_bvp_ab), 2)
+    expected_rbi = round(_blend_rate(bvp, hand_split, recent, "rbi", min_bvp_ab), 2)
+    expected_combined = round(expected_hits + expected_runs + expected_rbi, 2)
+
     return {
         "hit_score": hit_score,
         "run_score": run_score,
         "rbi_score": rbi_score,
         "combined_score": combined_score,
+        "expected_hits": expected_hits,
+        "expected_runs": expected_runs,
+        "expected_rbi": expected_rbi,
+        "expected_combined": expected_combined,
         "note": note,
     }
 
@@ -745,6 +796,10 @@ def analyze_date(date_str, min_bvp_ab=8, recent_days=15, delay=0.15, use_statcas
                     "run_score": scores["run_score"],
                     "rbi_score": scores["rbi_score"],
                     "combined_score": scores["combined_score"],
+                    "expected_hits": scores["expected_hits"],
+                    "expected_runs": scores["expected_runs"],
+                    "expected_rbi": scores["expected_rbi"],
+                    "expected_combined": scores["expected_combined"],
                     "note": scores["note"],
                 })
                 time.sleep(delay)  # be polite to the MLB Stats API
@@ -781,11 +836,13 @@ def run(date_str, min_bvp_ab, recent_days, delay, use_statcast, statcast_lookbac
         print("No batters processed -- lineups may not be posted yet for this date.")
         return
 
-    # --- Headline: combined score first, it's the "best overall bet" view ---
+    # --- Headline: expected combined count first -- this is the direct equivalent
+    # of a "Hits+Runs+RBIs" betting prop (a literal sum of counts, not an average
+    # of independent scores -- so a solo homer alone projects as high as 3).
     print_leaderboard(
-        rows, "combined_score", "TOP 10 COMBINED (avg of Hit/Run/RBI scores)",
-        extra_col=("  H/R/RBI",
-                   lambda r: f"  {r['hit_score']:.0f}/{r['run_score']:.0f}/{r['rbi_score']:.0f}"),
+        rows, "expected_combined", "TOP 10 PROJECTED H+R+RBI (expected combined count)",
+        extra_col=("  PROJ H/R/RBI",
+                   lambda r: f"  {r['expected_hits']:.2f}/{r['expected_runs']:.2f}/{r['expected_rbi']:.2f}"),
     )
 
     # --- Individual category leaderboards ---
