@@ -581,10 +581,16 @@ def score_batter(bvp, statcast_similar, hand_split, recent, lineup_slot, min_bvp
     run_score = pct((hit_component * 0.6 + recent_hit_rate * 0.4) * run_bias)
     rbi_score = pct((hit_component * 0.6 + recent_hit_rate * 0.4) * rbi_bias)
 
+    hit_score = round(hit_score, 1)
+    run_score = round(run_score, 1)
+    rbi_score = round(rbi_score, 1)
+    combined_score = round((hit_score + run_score + rbi_score) / 3, 1)
+
     return {
-        "hit_score": round(hit_score, 1),
-        "run_score": round(run_score, 1),
-        "rbi_score": round(rbi_score, 1),
+        "hit_score": hit_score,
+        "run_score": run_score,
+        "rbi_score": rbi_score,
+        "combined_score": combined_score,
         "note": note,
     }
 
@@ -738,11 +744,29 @@ def analyze_date(date_str, min_bvp_ab=8, recent_days=15, delay=0.15, use_statcas
                     "hit_score": scores["hit_score"],
                     "run_score": scores["run_score"],
                     "rbi_score": scores["rbi_score"],
+                    "combined_score": scores["combined_score"],
                     "note": scores["note"],
                 })
                 time.sleep(delay)  # be polite to the MLB Stats API
 
     return rows, games
+
+
+def print_leaderboard(rows, score_key, title, n=10, extra_col=None):
+    """Print a clean top-N table for a given score column."""
+    print("\n" + "=" * 78)
+    print(f"{title}  (top {n})")
+    print("=" * 78)
+    header = f"{'#':>2}  {'SCORE':>6}  {'BATTER':<22}{'TEAM':<18}{'OPP PITCHER':<20}"
+    if extra_col:
+        header += extra_col[0]
+    print(header)
+    print("-" * 78)
+    for i, r in enumerate(sorted(rows, key=lambda x: -x[score_key])[:n], start=1):
+        line = f"{i:>2}  {r[score_key]:>6.1f}  {r['batter']:<22}{r['team']:<18}{r['opp_pitcher']:<20}"
+        if extra_col:
+            line += extra_col[1](r)
+        print(line)
 
 
 def run(date_str, min_bvp_ab, recent_days, delay, use_statcast, statcast_lookback_days,
@@ -757,31 +781,27 @@ def run(date_str, min_bvp_ab, recent_days, delay, use_statcast, statcast_lookbac
         print("No batters processed -- lineups may not be posted yet for this date.")
         return
 
-    # --- Reports ---
-    print("\n" + "=" * 70)
-    print("TOP 15 HIT PROBABILITY")
-    print("=" * 70)
-    for r in sorted(rows, key=lambda x: -x["hit_score"])[:15]:
-        print(f"{r['hit_score']:>5} | {r['batter']:<22} ({r['team']}) vs {r['opp_pitcher']:<18} | {r['note']}")
+    # --- Headline: combined score first, it's the "best overall bet" view ---
+    print_leaderboard(
+        rows, "combined_score", "TOP 10 COMBINED (avg of Hit/Run/RBI scores)",
+        extra_col=("  H/R/RBI",
+                   lambda r: f"  {r['hit_score']:.0f}/{r['run_score']:.0f}/{r['rbi_score']:.0f}"),
+    )
 
-    print("\n" + "=" * 70)
-    print("TOP 15 RUN PROBABILITY")
-    print("=" * 70)
-    for r in sorted(rows, key=lambda x: -x["run_score"])[:15]:
-        print(f"{r['run_score']:>5} | {r['batter']:<22} ({r['team']}) slot {r['lineup_slot']}")
-
-    print("\n" + "=" * 70)
-    print("TOP 15 RBI PROBABILITY")
-    print("=" * 70)
-    for r in sorted(rows, key=lambda x: -x["rbi_score"])[:15]:
-        print(f"{r['rbi_score']:>5} | {r['batter']:<22} ({r['team']}) slot {r['lineup_slot']}")
+    # --- Individual category leaderboards ---
+    print_leaderboard(rows, "hit_score", "TOP 10 HIT PROBABILITY",
+                       extra_col=("  NOTE", lambda r: f"  {r['note']}"))
+    print_leaderboard(rows, "run_score", "TOP 10 RUN PROBABILITY",
+                       extra_col=("  SLOT", lambda r: f"  {r['lineup_slot']}"))
+    print_leaderboard(rows, "rbi_score", "TOP 10 RBI PROBABILITY",
+                       extra_col=("  SLOT", lambda r: f"  {r['lineup_slot']}"))
 
     out_path = f"mlb_report_{date_str}.csv"
     with open(out_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         writer.writeheader()
         writer.writerows(rows)
-    print(f"\nFull report saved to {out_path}")
+    print(f"\nFull report ({len(rows)} batters) saved to {out_path}")
 
 
 if __name__ == "__main__":
