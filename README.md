@@ -34,11 +34,21 @@ python mlb_daily_analysis.py --team Dodgers                # scope to one game, 
       last-resort proxy.
    4. **Recent form** — last 15 days of hitting, used both as a blend
       component and as the sole basis if nothing else qualifies.
-4. Combines these into Hit / Run / RBI probability scores, weighted toward
-   BvP/Statcast-similar per your preference, with lineup slot nudging
-   Run vs RBI scores.
-5. Prints top-15 leaderboards for each category and saves a full CSV,
-   including which data source each batter's score leaned on.
+4. Combines these into Hit / Run / RBI probability scores (0-100, weighted
+   toward BvP/Statcast-similar per your preference, with lineup slot
+   nudging Run vs RBI scores) AND real expected-count projections:
+   - `expected_hits` / `expected_runs` / `expected_rbi` / `expected_combined`
+     — a projected Hits+Runs+RBIs count for tonight, matching how
+     sportsbooks price that prop (a literal sum, so a solo homer alone
+     projects as high as 3).
+   - `expected_total_bases` — projected total bases (1×1B + 2×2B + 3×3B +
+     4×HR), its own standalone prop, built from a slugging-percentage blend
+     using the same BvP > Statcast-similar > hand-split > recent-form
+     priority chain as everything else.
+5. Prints leaderboards (Top 10 Projected H+R+RBI, Top 10 Projected Total
+   Bases, and the three individual Hit/Run/RBI score leaderboards) and
+   saves a full CSV with every field, including which data source each
+   batter's score leaned on.
 
 ## How the Statcast similarity works (v2)
 - Pulls the *target* pitcher's own pitch log for the lookback window
@@ -103,10 +113,16 @@ status), pulls each batter's real result for that game, and reports:
 - **Top-decile hit rate**: of the batters the model ranked in its top 10%
   for hit/run/RBI score each day, what fraction actually delivered? Shown
   against the baseline rate across all batters analyzed, plus the % lift.
-- **Correlation**: Pearson correlation between each score and whether the
-  outcome actually happened, across every batter-game in the window.
+- **Correlation**: Pearson correlation between each 0-100 score and whether
+  the outcome actually happened, across every batter-game in the window.
+- **Combined projection accuracy**: correlation AND mean absolute error
+  (MAE) between `expected_combined` (the projected Hits+Runs+RBIs count)
+  and the batter's actual combined count that game — this is the metric
+  that matters most for validating the prop-style projection, since it's a
+  continuous count rather than a hit/miss score.
 - A full CSV (`backtest_<start>_<end>.csv`) with every prediction next to
-  the actual H/R/RBI, so you can slice it further yourself.
+  the actual H/R/RBI (and actual_combined), so you can slice it further
+  yourself.
 
 **Leakage control:** recent-form and Statcast pulls are naturally bounded to
 data before the date being tested. BvP and hand-split are NOT bounded by
