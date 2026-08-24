@@ -41,9 +41,11 @@ time (pybaseball's on-disk cache speeds up repeat runs significantly).
 """
 
 import argparse
+import concurrent.futures
 import csv
 import math
 import sys
+import threading
 import time
 from datetime import datetime, timedelta
 
@@ -709,7 +711,7 @@ def get_game_batting_actuals(game_pk):
 
 def analyze_date(date_str, min_bvp_ab=8, recent_days=15, delay=0.15, use_statcast=True,
                   statcast_lookback_days=395, similarity_threshold=0.85, team_filter=None,
-                  bvp_seasons=None, final_games_only=False, verbose=True):
+                  bvp_seasons=None, final_games_only=False, verbose=True, workers=8):
     """
     Core analysis engine, reusable by both the live CLI (run()) and
     backtest.py. Returns (rows, games) where rows is the list of per-batter
@@ -722,6 +724,16 @@ def analyze_date(date_str, min_bvp_ab=8, recent_days=15, delay=0.15, use_statcas
 
     `final_games_only`: if True, skips any game that isn't status "Final" --
     used by the backtester so it only scores games with real results.
+
+    `workers`: number of batter-analysis tasks to run concurrently. This is
+    I/O-bound work (waiting on the MLB Stats API / Statcast), so threading
+    helps a lot -- a full slate that takes 30 min sequentially can drop to
+    well under a minute. Statcast (pybaseball/Baseball Savant) calls are
+    capped at a lower concurrency internally regardless of `workers`, since
+    Baseball Savant is more likely to throttle/error under heavy parallel
+    load than the MLB Stats API is. Lineup/pitcher-profile fetching (one
+    per team per game, not per batter) stays sequential -- it's cheap and
+    only needs to happen once per matchup.
     """
     def log(msg):
         if verbose:
@@ -754,8 +766,16 @@ def analyze_date(date_str, min_bvp_ab=8, recent_days=15, delay=0.15, use_statcas
     statcast_end = (datetime.strptime(date_str, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")  # no same-day leakage
 
     log(f"Found {len(games)} game(s) to analyze for {date_str}.\n")
-    rows = []
 
+    # Statcast calls get their own, smaller concurrency cap regardless of
+    # `workers` -- Baseball Savant is more fragile under heavy parallel load
+    # than the MLB Stats API is.
+    statcast_semaphore = threading.Semaphore(max(1, min(workers, 4)))
+
+    # --- Phase 1: build the task list. Sequential, but cheap -- one lineup
+    # fetch and one pitcher-arsenal-profile fetch per team per game, not per
+    # batter. ---
+    tasks = []
     for g in games:
         matchups = [
             ("away", g["away_team_id"], g["away_team_name"], g["home_pitcher"]),
@@ -788,47 +808,78 @@ def analyze_date(date_str, min_bvp_ab=8, recent_days=15, delay=0.15, use_statcas
             for pid, name, slot in lineup:
                 if not pid:
                     continue
-                bvp = get_bvp(pid, pitcher_id, seasons=bvp_seasons)
-                hand_split = get_vs_hand_split(pid, pitcher_hand, seasons=bvp_seasons)
-                recent = get_recent_form(pid, date_str, days=recent_days)
-
-                statcast_similar = None
-                if use_statcast and target_profile is not None and (not bvp or bvp["ab"] < min_bvp_ab):
-                    statcast_similar = get_similar_pitcher_stats(
-                        pid, pitcher_id, target_profile, statcast_start, statcast_end,
-                        similarity_threshold=similarity_threshold,
-                    )
-
-                scores = score_batter(bvp, statcast_similar, hand_split, recent, slot, min_bvp_ab)
-
-                rows.append({
-                    "date": date_str,
+                tasks.append({
+                    "pid": pid, "name": name, "slot": slot,
                     "gamePk": g["gamePk"],
                     "game": f"{g['away_team_name']} @ {g['home_team_name']}",
-                    "batter_id": pid,
-                    "batter": name,
-                    "team": team_name,
-                    "lineup_slot": slot,
-                    "opp_pitcher": pitcher_name,
-                    "pitcher_hand": pitcher_hand,
-                    "bvp_ab": bvp["ab"] if bvp else 0,
-                    "bvp_avg": bvp["avg"] if bvp else None,
-                    "statcast_similar_ab": statcast_similar["ab"] if statcast_similar else None,
-                    "statcast_similar_avg": statcast_similar["avg"] if statcast_similar else None,
-                    "statcast_n_similar_pitchers": statcast_similar["n_similar_pitchers"] if statcast_similar else None,
-                    "recent_avg": recent["avg"] if recent else None,
-                    "hit_score": scores["hit_score"],
-                    "run_score": scores["run_score"],
-                    "rbi_score": scores["rbi_score"],
-                    "combined_score": scores["combined_score"],
-                    "expected_hits": scores["expected_hits"],
-                    "expected_runs": scores["expected_runs"],
-                    "expected_rbi": scores["expected_rbi"],
-                    "expected_combined": scores["expected_combined"],
-                    "expected_total_bases": scores["expected_total_bases"],
-                    "note": scores["note"],
+                    "team_name": team_name,
+                    "pitcher_id": pitcher_id, "pitcher_name": pitcher_name, "pitcher_hand": pitcher_hand,
+                    "target_profile": target_profile,
                 })
-                time.sleep(delay)  # be polite to the MLB Stats API
+
+    if not tasks:
+        return [], games
+
+    # --- Phase 2: run the per-batter analysis (the actual API-heavy part)
+    # concurrently across all matchups for the day. ---
+    def process_task(t):
+        pid = t["pid"]
+        bvp = get_bvp(pid, t["pitcher_id"], seasons=bvp_seasons)
+        hand_split = get_vs_hand_split(pid, t["pitcher_hand"], seasons=bvp_seasons)
+        recent = get_recent_form(pid, date_str, days=recent_days)
+
+        statcast_similar = None
+        if use_statcast and t["target_profile"] is not None and (not bvp or bvp["ab"] < min_bvp_ab):
+            with statcast_semaphore:
+                statcast_similar = get_similar_pitcher_stats(
+                    pid, t["pitcher_id"], t["target_profile"], statcast_start, statcast_end,
+                    similarity_threshold=similarity_threshold,
+                )
+
+        scores = score_batter(bvp, statcast_similar, hand_split, recent, t["slot"], min_bvp_ab)
+
+        return {
+            "date": date_str,
+            "gamePk": t["gamePk"],
+            "game": t["game"],
+            "batter_id": pid,
+            "batter": t["name"],
+            "team": t["team_name"],
+            "lineup_slot": t["slot"],
+            "opp_pitcher": t["pitcher_name"],
+            "pitcher_hand": t["pitcher_hand"],
+            "bvp_ab": bvp["ab"] if bvp else 0,
+            "bvp_avg": bvp["avg"] if bvp else None,
+            "statcast_similar_ab": statcast_similar["ab"] if statcast_similar else None,
+            "statcast_similar_avg": statcast_similar["avg"] if statcast_similar else None,
+            "statcast_n_similar_pitchers": statcast_similar["n_similar_pitchers"] if statcast_similar else None,
+            "recent_avg": recent["avg"] if recent else None,
+            "hit_score": scores["hit_score"],
+            "run_score": scores["run_score"],
+            "rbi_score": scores["rbi_score"],
+            "combined_score": scores["combined_score"],
+            "expected_hits": scores["expected_hits"],
+            "expected_runs": scores["expected_runs"],
+            "expected_rbi": scores["expected_rbi"],
+            "expected_combined": scores["expected_combined"],
+            "expected_total_bases": scores["expected_total_bases"],
+            "note": scores["note"],
+        }
+
+    rows = []
+    errors = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
+        futures = {executor.submit(process_task, t): t for t in tasks}
+        for future in concurrent.futures.as_completed(futures):
+            t = futures[future]
+            try:
+                rows.append(future.result())
+            except Exception as e:
+                errors += 1
+                log(f"  [ERROR] {t['name']} ({t['team_name']}): {e}")
+
+    if errors:
+        log(f"  {errors} batter(s) failed and were skipped -- see errors above.")
 
     return rows, games
 
@@ -851,11 +902,11 @@ def print_leaderboard(rows, score_key, title, n=10, extra_col=None):
 
 
 def run(date_str, min_bvp_ab, recent_days, delay, use_statcast, statcast_lookback_days,
-        similarity_threshold, team_filter=None):
+        similarity_threshold, team_filter=None, workers=8):
     rows, games = analyze_date(
         date_str, min_bvp_ab=min_bvp_ab, recent_days=recent_days, delay=delay,
         use_statcast=use_statcast, statcast_lookback_days=statcast_lookback_days,
-        similarity_threshold=similarity_threshold, team_filter=team_filter,
+        similarity_threshold=similarity_threshold, team_filter=team_filter, workers=workers,
     )
 
     if not rows:
@@ -903,7 +954,12 @@ if __name__ == "__main__":
     parser.add_argument("--recent-days", type=int, default=15,
                          help="Trailing window for 'recent form' (default: 15 days)")
     parser.add_argument("--delay", type=float, default=0.15,
-                         help="Seconds to sleep between API calls, be polite (default: 0.15)")
+                         help="Unused now that requests run concurrently -- kept for backward "
+                              "compatibility, has no effect. Use --workers to control speed/load instead.")
+    parser.add_argument("--workers", type=int, default=8,
+                         help="Number of batters to analyze concurrently (default: 8). Higher is "
+                              "faster but hits the MLB Stats API harder. Statcast calls are capped "
+                              "at min(workers, 4) internally regardless of this setting.")
     parser.add_argument("--no-statcast", action="store_true",
                          help="Skip Statcast pitcher-similarity analysis (much faster, uses hand-split fallback only)")
     parser.add_argument("--statcast-lookback-days", type=int, default=395,
@@ -922,4 +978,5 @@ if __name__ == "__main__":
         use_statcast=not args.no_statcast,
         statcast_lookback_days=args.statcast_lookback_days,
         similarity_threshold=args.similarity_threshold,
-        team_filter=args.team)
+        team_filter=args.team,
+        workers=args.workers)

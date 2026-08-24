@@ -136,5 +136,21 @@ backtest numbers are a conservative lower bound on how the live model
 
 Recommended first run: `--no-statcast` on a 2-3 day window to confirm the
 plumbing and actual-results join work, before committing to a full 1-2
-week Statcast-enabled backtest (which will be slow — one Statcast pull per
-batter per day, mostly cached after the first pass through a given player).
+week Statcast-enabled backtest.
+
+## Speed (--workers)
+Both scripts analyze batters concurrently now instead of one at a time --
+this is I/O-bound work (waiting on the MLB Stats API / Statcast), so
+threading gives a large speedup with no infra changes needed. Control it
+with `--workers` (default 8):
+```bash
+python backtest.py --start-date 2026-08-01 --end-date 2026-08-14 --workers 12
+python mlb_daily_analysis.py --workers 12
+```
+Statcast (pybaseball/Baseball Savant) calls are capped at `min(workers, 4)`
+internally regardless of what you set `--workers` to, since Baseball Savant
+is more likely to throttle or error under heavy parallel load than the MLB
+Stats API is. If you hit errors or rate-limit responses, lower `--workers`;
+if it's running smoothly, you can push it higher. The old `--delay` flag no
+longer does anything (kept for backward compatibility) -- concurrency is
+now the throttle.

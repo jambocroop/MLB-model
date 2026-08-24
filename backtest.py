@@ -116,7 +116,7 @@ def top_decile_hit_rate(rows, score_key, actual_key):
 
 
 def run_backtest(start_date, end_date, use_statcast, min_bvp_ab, recent_days,
-                  statcast_lookback_days, similarity_threshold, team_filter, delay):
+                  statcast_lookback_days, similarity_threshold, team_filter, delay, workers=8):
     all_rows = []
 
     for date_str in daterange(start_date, end_date):
@@ -136,6 +136,7 @@ def run_backtest(start_date, end_date, use_statcast, min_bvp_ab, recent_days,
             bvp_seasons=bvp_seasons,
             final_games_only=True,
             verbose=True,
+            workers=workers,
         )
         if not rows:
             print(f"  No completed games/predictions for {date_str}, skipping.")
@@ -253,6 +254,11 @@ if __name__ == "__main__":
     parser.add_argument("--team", type=str, default=None,
                          help="Scope to specific teams each day, comma-separated for multiple, "
                               "e.g. --team \"Dodgers,Yankees\". Useful for a fast test run.")
+    parser.add_argument("--workers", type=int, default=8,
+                         help="Number of batters to analyze concurrently per day (default: 8). "
+                              "This is the main lever for backtest speed -- a 2-week backtest that "
+                              "took 30 min sequentially should drop dramatically with this. "
+                              "Statcast calls are capped at min(workers, 4) internally regardless.")
     args = parser.parse_args()
 
     run_backtest(
@@ -264,4 +270,5 @@ if __name__ == "__main__":
         similarity_threshold=args.similarity_threshold,
         team_filter=args.team,
         delay=args.delay,
+        workers=args.workers,
     )
