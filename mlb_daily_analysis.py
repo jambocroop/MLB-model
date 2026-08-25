@@ -216,14 +216,25 @@ def get_lineup(game_pk, team_side, team_id, date_str):
 # ---------------------------------------------------------------------------
 
 def get_recent_form(batter_id, end_date, days=15):
-    """Hitting stats over the trailing `days` window."""
+    """
+    Hitting stats over the trailing `days` window, ending the day BEFORE
+    `end_date` -- not including `end_date` itself.
+
+    This matters most for backtesting: `end_date` is the date being tested,
+    and by the time a backtest runs, that date is in the past, so MLB's API
+    would otherwise include that day's own (already-known) game result in
+    the "recent form" used to predict it -- a real leakage bug. Excluding
+    it is also simply more correct for live use (you're never supposed to
+    know today's game stats before today's game happens).
+    """
+    window_end = (datetime.strptime(end_date, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
     start_date = (datetime.strptime(end_date, "%Y-%m-%d") - timedelta(days=days)).strftime("%Y-%m-%d")
     data = api_get(
         f"{BASE}/people/{batter_id}/stats",
         params={
             "stats": "byDateRange",
             "startDate": start_date,
-            "endDate": end_date,
+            "endDate": window_end,
             "group": "hitting",
             "sportId": 1,
         },
