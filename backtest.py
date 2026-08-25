@@ -48,9 +48,41 @@ OUTPUT:
 import argparse
 import csv
 import math
+import os
 from datetime import datetime, timedelta
 
 from mlb_daily_analysis import analyze_date, get_game_batting_actuals
+
+FIELDNAMES = [
+    "date", "gamePk", "game", "batter_id", "batter", "team", "lineup_slot",
+    "opp_pitcher", "pitcher_hand", "bvp_ab", "bvp_avg", "statcast_similar_ab",
+    "statcast_similar_avg", "statcast_n_similar_pitchers", "recent_avg",
+    "hit_score", "run_score", "rbi_score", "combined_score",
+    "expected_hits", "expected_runs", "expected_rbi", "expected_combined",
+    "expected_total_bases", "note",
+    "actual_ab", "actual_h", "actual_r", "actual_rbi", "actual_combined", "actual_total_bases",
+]
+
+
+def _coerce_row_types(row):
+    """CSV round-trips everything as strings -- convert the numeric fields
+    back so a resumed run's old rows behave the same as freshly computed ones."""
+    def to_float(v):
+        return None if v in (None, "") else float(v)
+
+    def to_int(v):
+        return None if v in (None, "") else int(float(v))
+
+    for key in ("gamePk", "batter_id", "lineup_slot", "statcast_similar_ab",
+                "statcast_n_similar_pitchers", "actual_ab", "actual_h", "actual_r",
+                "actual_rbi", "actual_combined", "actual_total_bases"):
+        row[key] = to_int(row.get(key))
+    row["bvp_ab"] = to_int(row.get("bvp_ab")) or 0
+    for key in ("bvp_avg", "statcast_similar_avg", "recent_avg", "hit_score", "run_score",
+                "rbi_score", "combined_score", "expected_hits", "expected_runs",
+                "expected_rbi", "expected_combined", "expected_total_bases"):
+        row[key] = to_float(row.get(key))
+    return row
 
 
 def daterange(start_date, end_date):
@@ -117,69 +149,102 @@ def top_decile_hit_rate(rows, score_key, actual_key):
 
 def run_backtest(start_date, end_date, use_statcast, min_bvp_ab, recent_days,
                   statcast_lookback_days, similarity_threshold, team_filter, delay, workers=8):
+    out_path = f"backtest_{start_date}_{end_date}.csv"
+
     all_rows = []
+    completed_dates = set()
 
-    for date_str in daterange(start_date, end_date):
-        year = int(date_str[:4])
-        bvp_seasons = [year - 1, year - 2]  # strictly prior seasons only -- leak-free
+    # --- Resume support: if this exact backtest was already partially run,
+    # pick up where it left off instead of redoing (and re-hitting the API
+    # for) dates that are already saved. ---
+    if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+        with open(out_path, newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                all_rows.append(_coerce_row_types(row))
+        completed_dates = {r["date"] for r in all_rows}
+        if completed_dates:
+            print(f"Resuming {out_path}: {len(all_rows)} rows across {len(completed_dates)} "
+                  f"date(s) already completed -- skipping those.\n")
 
-        print(f"\n{'=' * 70}\nBACKTESTING {date_str}  (BvP/hand-split limited to seasons {bvp_seasons})\n{'=' * 70}")
-        rows, games = analyze_date(
-            date_str,
-            min_bvp_ab=min_bvp_ab,
-            recent_days=recent_days,
-            delay=delay,
-            use_statcast=use_statcast,
-            statcast_lookback_days=statcast_lookback_days,
-            similarity_threshold=similarity_threshold,
-            team_filter=team_filter,
-            bvp_seasons=bvp_seasons,
-            final_games_only=True,
-            verbose=True,
-            workers=workers,
-        )
-        if not rows:
-            print(f"  No completed games/predictions for {date_str}, skipping.")
-            continue
+    csv_file = None
+    csv_writer = None
 
-        # Pull actual results per game (one boxscore call per game, cached across batters)
-        actuals_by_game = {}
-        for g in games:
-            if g.get("status") != "Final":
+    def get_writer():
+        nonlocal csv_file, csv_writer
+        if csv_writer is None:
+            is_new = not (os.path.exists(out_path) and os.path.getsize(out_path) > 0)
+            csv_file = open(out_path, "a", newline="")
+            csv_writer = csv.DictWriter(csv_file, fieldnames=FIELDNAMES)
+            if is_new:
+                csv_writer.writeheader()
+        return csv_writer
+
+    try:
+        for date_str in daterange(start_date, end_date):
+            if date_str in completed_dates:
+                print(f"Skipping {date_str} -- already completed (resume).")
                 continue
-            actuals_by_game[g["gamePk"]] = get_game_batting_actuals(g["gamePk"])
 
-        for r in rows:
-            actuals = actuals_by_game.get(r["gamePk"], {})
-            a = actuals.get(r["batter_id"])
-            if a is None:
-                r["actual_ab"] = None
-                r["actual_h"] = None
-                r["actual_r"] = None
-                r["actual_rbi"] = None
-                r["actual_combined"] = None
-                r["actual_total_bases"] = None
-            else:
+            year = int(date_str[:4])
+            bvp_seasons = [year - 1, year - 2]  # strictly prior seasons only -- leak-free
+
+            print(f"\n{'=' * 70}\nBACKTESTING {date_str}  (BvP/hand-split limited to seasons {bvp_seasons})\n{'=' * 70}")
+            rows, games = analyze_date(
+                date_str,
+                min_bvp_ab=min_bvp_ab,
+                recent_days=recent_days,
+                delay=delay,
+                use_statcast=use_statcast,
+                statcast_lookback_days=statcast_lookback_days,
+                similarity_threshold=similarity_threshold,
+                team_filter=team_filter,
+                bvp_seasons=bvp_seasons,
+                final_games_only=True,
+                verbose=True,
+                workers=workers,
+            )
+            if not rows:
+                print(f"  No completed games/predictions for {date_str}, skipping.")
+                continue
+
+            # Pull actual results per game (one boxscore call per game, cached across batters)
+            actuals_by_game = {}
+            for g in games:
+                if g.get("status") != "Final":
+                    continue
+                actuals_by_game[g["gamePk"]] = get_game_batting_actuals(g["gamePk"])
+
+            day_scored_rows = []
+            for r in rows:
+                actuals = actuals_by_game.get(r["gamePk"], {})
+                a = actuals.get(r["batter_id"])
+                if a is None:
+                    continue  # batter didn't end up playing / no boxscore line -- drop, not a prediction we can score
                 r["actual_ab"] = a["ab"]
                 r["actual_h"] = a["h"]
                 r["actual_r"] = a["r"]
                 r["actual_rbi"] = a["rbi"]
                 r["actual_combined"] = a["h"] + a["r"] + a["rbi"]
                 r["actual_total_bases"] = a["tb"]
-            all_rows.append(r)
+                day_scored_rows.append(r)
 
-    # Drop rows with no actual result (e.g. batter didn't end up playing)
-    scored_rows = [r for r in all_rows if r["actual_ab"] is not None]
+            if day_scored_rows:
+                writer = get_writer()
+                for r in day_scored_rows:
+                    writer.writerow(r)
+                csv_file.flush()
+                all_rows.extend(day_scored_rows)
+                print(f"  Saved {len(day_scored_rows)} batter-games for {date_str} to {out_path}.")
+    finally:
+        if csv_file:
+            csv_file.close()
+
+    scored_rows = all_rows  # everything in all_rows already has actual results by construction
 
     if not scored_rows:
         print("\nNo batter-games could be matched to actual results. Nothing to report.")
         return
-
-    out_path = f"backtest_{start_date}_{end_date}.csv"
-    with open(out_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(scored_rows[0].keys()))
-        writer.writeheader()
-        writer.writerows(scored_rows)
 
     # --- Metrics ---
     print(f"\n\n{'#' * 70}")
