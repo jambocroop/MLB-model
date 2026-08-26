@@ -402,6 +402,16 @@ PITCH_BUCKETS = {
 }
 STATCAST_HIT_EVENTS = {"single", "double", "triple", "home_run"}
 TOTAL_BASE_VALUES = {"single": 1, "double": 2, "triple": 3, "home_run": 4}
+
+# Rough league-average at-bats-per-game by lineup slot. Leadoff/2-hole hitters
+# get noticeably more plate appearances over a season than the bottom of the
+# order, purely from batting order mechanics. Used as a baseline to flag
+# batters getting fewer at-bats than their slot would predict -- a signal of
+# platooning, early pinch-hit removal, part-time play, etc. Approximate, not
+# derived from this season's actual data.
+EXPECTED_AB_PER_SLOT = {1: 4.6, 2: 4.5, 3: 4.4, 4: 4.3, 5: 4.2, 6: 4.1, 7: 4.0, 8: 3.9, 9: 3.7}
+LOW_PA_RELIABILITY_THRESHOLD = 0.75
+
 STATCAST_AB_EXCLUDE_EVENTS = {
     "walk", "hit_by_pitch", "sac_bunt", "sac_fly", "sac_fly_double_play",
     "catcher_interf", "intent_walk", "batter_interference",
@@ -555,6 +565,30 @@ def _rate_per_game(split, key):
     return split[key] / split["games"]
 
 
+def _confidence_scaled_handsplit_weights(bvp_ab, min_bvp_ab, base_weights):
+    """
+    base_weights = (w_hand, w_recent, w_bvp), fit/chosen assuming a BvP sample
+    right at the edge of min_bvp_ab (i.e. as thin as this tier gets while still
+    being "present"). Applied flat, that formula treats a 1-AB BvP sample
+    (nearly pure noise) the same as a 7-AB sample (still thin, but far more
+    informative) -- which makes individual projections swing wildly when a
+    player happens to have a tiny, extreme (e.g. 0-for-2) BvP sample.
+
+    This scales w_bvp down linearly as bvp_ab shrinks toward 0, redistributing
+    the freed weight proportionally across hand_split and recent. Continuous
+    at both ends: returns base_weights unchanged at bvp_ab=min_bvp_ab, and
+    drops BvP's weight to 0 (pure hand_split + recent) at bvp_ab=0.
+    """
+    w_hand, w_recent, w_bvp = base_weights
+    confidence = max(0.0, min(1.0, bvp_ab / min_bvp_ab)) if min_bvp_ab else 1.0
+    eff_bvp = w_bvp * confidence
+    remaining = 1 - eff_bvp
+    hand_recent_total = w_hand + w_recent
+    if hand_recent_total <= 0:
+        return remaining / 2, remaining / 2, eff_bvp
+    return remaining * (w_hand / hand_recent_total), remaining * (w_recent / hand_recent_total), eff_bvp
+
+
 def _blend_rate(bvp, hand_split, recent, key, min_bvp_ab,
                  bvp_tier_weights=(0.65, 0.35), handsplit_tier_weights=(0.45, 0.30, 0.25)):
     """
@@ -580,7 +614,8 @@ def _blend_rate(bvp, hand_split, recent, key, min_bvp_ab,
         w_bvp, w_recent = bvp_tier_weights
         return w_bvp * bvp_rate + w_recent * recent_rate
     elif hand_split and hand_split["ab"] >= min_bvp_ab and hand_rate is not None:
-        w_hand, w_recent, w_bvp = handsplit_tier_weights
+        bvp_ab_n = bvp["ab"] if bvp else 0
+        w_hand, w_recent, w_bvp = _confidence_scaled_handsplit_weights(bvp_ab_n, min_bvp_ab, handsplit_tier_weights)
         return w_hand * hand_rate + w_recent * recent_rate + w_bvp * (bvp_rate or 0.0)
     else:
         return recent_rate
@@ -631,10 +666,14 @@ def score_batter(bvp, statcast_similar, hand_split, recent, lineup_slot, min_bvp
     elif hand_split and hand_split["ab"] >= min_bvp_ab:
         # Weights fit from backtest data (fit_weights.py): hand_split=0.37, recent=0.18,
         # bvp=0.45 -- real, holdout-validated improvement over the original 0.45/0.30/0.25
-        # guess (r 0.450 -> 0.493). Notably, even a thin BvP sample carries more signal
-        # here than the original weighting gave it credit for.
-        hit_component = 0.37 * hand_split["avg"] + 0.18 * recent_avg + 0.45 * bvp_avg
-        note = f"BvP/Statcast-similar too small -- used vs-hand split ({hand_split['ab']} AB, {hand_split['avg']:.3f}) as proxy"
+        # guess (r 0.450 -> 0.493), BUT applied flat that treats a 1-AB BvP sample the
+        # same as a 7-AB one -- confidence-scale bvp's weight by its own sample size so
+        # a near-empty BvP sample doesn't swing the whole projection on noise.
+        bvp_ab_n = bvp["ab"] if bvp else 0
+        w_hand, w_recent, w_bvp = _confidence_scaled_handsplit_weights(bvp_ab_n, min_bvp_ab, (0.37, 0.18, 0.45))
+        hit_component = w_hand * hand_split["avg"] + w_recent * recent_avg + w_bvp * bvp_avg
+        note = (f"BvP/Statcast-similar too small -- used vs-hand split ({hand_split['ab']} AB, "
+                f"{hand_split['avg']:.3f}) as proxy (BvP confidence: {bvp_ab_n}/{min_bvp_ab} AB)")
     else:
         hit_component = recent_avg
         note = "No usable BvP, Statcast-similar, or hand-split sample -- recent form only"
@@ -653,7 +692,11 @@ def score_batter(bvp, statcast_similar, hand_split, recent, lineup_slot, min_bvp
     elif hand_split and hand_split["ab"] >= min_bvp_ab:
         # Fitted weights (fit_weights.py): hand_split=0.31, recent=0.17, bvp=0.52 --
         # real improvement over the original 0.45/0.30/0.25 guess (r 0.494 -> 0.542).
-        slg_component = 0.31 * hand_split["slg"] + 0.17 * recent_slg + 0.52 * bvp_slg
+        # Same confidence-scaling as hits above -- bvp=0.52 is even more aggressive,
+        # so this matters more here, not less.
+        bvp_ab_n2 = bvp["ab"] if bvp else 0
+        w_hand2, w_recent2, w_bvp2 = _confidence_scaled_handsplit_weights(bvp_ab_n2, min_bvp_ab, (0.31, 0.17, 0.52))
+        slg_component = w_hand2 * hand_split["slg"] + w_recent2 * recent_slg + w_bvp2 * bvp_slg
     else:
         slg_component = recent_slg
 
@@ -692,6 +735,21 @@ def score_batter(bvp, statcast_similar, hand_split, recent, lineup_slot, min_bvp
     expected_combined = round(expected_hits + expected_runs + expected_rbi, 2)
     expected_total_bases = round(ab_per_game * slg_component, 2)
 
+    # --- Playing-time reliability flag ---
+    # Not a prediction of pinch-hit substitution (that depends on bullpen
+    # composition, game state, and day-of decisions we don't have access to).
+    # This is a visible caution flag, not a silent adjustment to the
+    # projections above: a batter getting notably fewer at-bats per game
+    # than their lineup slot would predict is a real signal of platooning,
+    # early removal, or part-time play -- worth knowing before trusting a
+    # high projection, even though we don't touch the projection itself.
+    expected_ab_for_slot = EXPECTED_AB_PER_SLOT.get(lineup_slot, 4.0)
+    pa_reliability = None
+    low_pa_flag = False
+    if recent and recent.get("games"):
+        pa_reliability = round(min(1.0, ab_per_game / expected_ab_for_slot), 2)
+        low_pa_flag = pa_reliability < LOW_PA_RELIABILITY_THRESHOLD
+
     return {
         "hit_score": hit_score,
         "run_score": run_score,
@@ -702,6 +760,8 @@ def score_batter(bvp, statcast_similar, hand_split, recent, lineup_slot, min_bvp
         "expected_rbi": expected_rbi,
         "expected_combined": expected_combined,
         "expected_total_bases": expected_total_bases,
+        "pa_reliability": pa_reliability,
+        "low_pa_flag": low_pa_flag,
         "note": note,
     }
 
@@ -917,6 +977,8 @@ def analyze_date(date_str, min_bvp_ab=8, recent_days=15, delay=0.15, use_statcas
             "expected_rbi": scores["expected_rbi"],
             "expected_combined": scores["expected_combined"],
             "expected_total_bases": scores["expected_total_bases"],
+            "pa_reliability": scores["pa_reliability"],
+            "low_pa_flag": scores["low_pa_flag"],
             "note": scores["note"],
         }
 
@@ -943,13 +1005,14 @@ def print_leaderboard(rows, score_key, title, n=10, extra_col=None):
     print("\n" + "=" * 78)
     print(f"{title}  (top {n})")
     print("=" * 78)
-    header = f"{'#':>2}  {'SCORE':>6}  {'BATTER':<22}{'TEAM':<18}{'OPP PITCHER':<20}"
+    header = f"{'#':>2}  {'SCORE':>6}  {'BATTER':<24}{'TEAM':<18}{'OPP PITCHER':<20}"
     if extra_col:
         header += extra_col[0]
     print(header)
     print("-" * 78)
     for i, r in enumerate(sorted(rows, key=lambda x: -x[score_key])[:n], start=1):
-        line = f"{i:>2}  {r[score_key]:>6.1f}  {r['batter']:<22}{r['team']:<18}{r['opp_pitcher']:<20}"
+        name = ("\u26a0 " + r["batter"]) if r.get("low_pa_flag") else r["batter"]
+        line = f"{i:>2}  {r[score_key]:>6.1f}  {name:<24}{r['team']:<18}{r['opp_pitcher']:<20}"
         if extra_col:
             line += extra_col[1](r)
         print(line)
@@ -975,6 +1038,8 @@ def run(date_str, min_bvp_ab, recent_days, delay, use_statcast, statcast_lookbac
         extra_col=("  PROJ H/R/RBI",
                    lambda r: f"  {r['expected_hits']:.2f}/{r['expected_runs']:.2f}/{r['expected_rbi']:.2f}"),
     )
+    print("(\u26a0 = getting notably fewer at-bats per game than their lineup slot would predict --"
+          " platooning/part-time play risk. Not a substitution prediction, just a caution flag.)")
 
     # --- Total Bases: its own standalone prop, projected from slugging (not part
     # of the H+R+RBI combined number above) ---

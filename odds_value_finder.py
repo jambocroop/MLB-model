@@ -208,6 +208,56 @@ def build_name_index(rows):
 # Main
 # ---------------------------------------------------------------------------
 
+def check_market_calibration(all_matches, warn_threshold=0.10, min_n=10):
+    """
+    Sanity check: for each market, compare the model's AVERAGE probability to
+    the market's AVERAGE (de-vigged) probability across all matched players.
+
+    This catches a specific, real failure mode (found the hard way): a bug or
+    miscalibration in the model produces a systematic bias in one direction
+    for an entire market. A genuine per-player edge should be scattered in
+    both directions -- some players the model likes more than the market,
+    some less -- and roughly cancel out on average. If instead the model's
+    average sits far below (or above) the market's average across dozens of
+    players in the same market, that's a strong signal something's wrong
+    with the projection itself, not that real value was found everywhere.
+
+    Returns the list of flagged market keys and prints a report; does not
+    filter or alter any bets -- just flags markets worth distrusting.
+    """
+    by_market = {}
+    for m in all_matches:
+        by_market.setdefault(m["market"], []).append(m)
+
+    print("\n" + "=" * 90)
+    print("MODEL CALIBRATION CHECK  (model avg prob vs market avg prob, per market)")
+    print("=" * 90)
+    flagged_markets = []
+    for market in sorted(by_market):
+        rows = by_market[market]
+        if len(rows) < min_n:
+            print(f"{market:<24} n={len(rows):<4} [skipped -- fewer than {min_n} matches to judge]")
+            continue
+        avg_model = sum(r["model_prob"] for r in rows) / len(rows)
+        avg_market = sum(r["market_prob"] for r in rows) / len(rows)
+        gap = avg_model - avg_market
+        flagged = abs(gap) >= warn_threshold
+        status = "\u26a0 SUSPICIOUS" if flagged else "OK"
+        if flagged:
+            flagged_markets.append(market)
+        print(f"{market:<24} n={len(rows):<4} model_avg={avg_model:.3f}  market_avg={avg_market:.3f}  "
+              f"gap={gap:+.3f}  [{status}]")
+
+    if flagged_markets:
+        print(f"\n\u26a0 Systematic gap found in: {', '.join(flagged_markets)}")
+        print("  A real per-player edge should roughly cancel out across many players in the")
+        print("  same market -- a large SAME-DIRECTION gap usually means a bug or miscalibration")
+        print("  in that projection, not real distributed value. Treat 'value bets' in flagged")
+        print("  markets with real skepticism until the underlying projection is checked.")
+    print()
+    return flagged_markets
+
+
 def find_value_bets(model_rows, api_key, markets, min_edge=0.05):
     name_index = build_name_index(model_rows)
     events = get_todays_mlb_events(api_key)
@@ -308,6 +358,8 @@ def main(date_str, api_key, markets, team_filter, min_edge, csv_path):
 
     all_matches, value_bets = find_value_bets(rows, api_key, markets, min_edge)
 
+    flagged_markets = check_market_calibration(all_matches) if all_matches else []
+
     print(f"\n{'=' * 90}")
     print(f"TOP VALUE BETS  (edge >= {min_edge:.0%}, sorted by EV per $1 staked)")
     print(f"{'=' * 90}")
@@ -315,9 +367,10 @@ def main(date_str, api_key, markets, team_filter, min_edge, csv_path):
         print("No bets cleared the edge threshold. Either the market is efficient today, "
               "the name-matching missed some players, or try lowering --min-edge.")
     for b in value_bets[:20]:
+        flag = "  \u26a0 FLAGGED MARKET" if b["market"] in flagged_markets else ""
         print(f"{b['batter']:<22} {b['market']:<22} line={b['line']:<5} @{b['book']:<12} "
               f"price={b['over_price']:>5}  model={b['model_prob']:.1%} vs market={b['market_prob']:.1%}  "
-              f"edge={b['edge']:+.1%}  EV=${b['ev_per_dollar']:+.3f}")
+              f"edge={b['edge']:+.1%}  EV=${b['ev_per_dollar']:+.3f}{flag}")
 
     if all_matches:
         out_path = f"odds_value_{date_str}.csv"
