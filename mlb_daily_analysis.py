@@ -431,6 +431,39 @@ LOW_PA_RELIABILITY_THRESHOLD = 0.75
 RUNS_CALIBRATION_BY_TIER = {"bvp": 2.75, "handsplit": 2.93, "recent_only": 1.0}
 RBI_CALIBRATION_BY_TIER = {"bvp": 1.34, "handsplit": 1.33, "recent_only": 1.0}
 
+# Confidence tiers for expected_combined / expected_total_bases, based on margin
+# above a 1.5 line -- the most common book line for both props. Boundaries are
+# empirical, from backtest hit-rate-by-margin analysis (2026-07-16 to 2026-08-25,
+# n~9800 for Combined, ~3100 for Total Bases): actual clear-the-line rate rose
+# monotonically with margin above 1.5 for both metrics --
+#   1.5-1.8 (WEAK):      ~42% actual clear rate  -- BELOW the ~52.4% -110 breakeven
+#   1.8-2.2 (MODERATE):  ~51-52%                 -- roughly at breakeven
+#   2.2-2.6 (GOOD):      ~55-58%                 -- real edge
+#   2.6+    (STRONG):    ~65-67%                 -- strongest edge
+# "Barely clears the line" is NOT the same as "good pick" -- WEAK-tier picks
+# actually underperformed a coin flip in backtesting. This is tuned to a 1.5
+# line specifically; a book offering a materially different line (e.g. 2.5)
+# needs its own margin bands, not an automatic rescale of these. Re-validate
+# periodically against a fresh backtest rather than treating as permanent.
+CONFIDENCE_TIER_LINE = 1.5
+CONFIDENCE_TIER_BOUNDARIES = [
+    (1.1, "STRONG"),     # value >= 2.6
+    (0.7, "GOOD"),       # value >= 2.2
+    (0.3, "MODERATE"),   # value >= 1.8
+    (0.0, "WEAK"),       # value >= 1.5
+]
+
+
+def confidence_tier(value, line=CONFIDENCE_TIER_LINE):
+    """Classify a projection into a confidence tier based on margin above `line`."""
+    if value is None:
+        return "N/A"
+    margin = value - line
+    for threshold, label in CONFIDENCE_TIER_BOUNDARIES:
+        if margin >= threshold:
+            return label
+    return "BELOW LINE"
+
 STATCAST_AB_EXCLUDE_EVENTS = {
     "walk", "hit_by_pitch", "sac_bunt", "sac_fly", "sac_fly_double_play",
     "catcher_interf", "intent_walk", "batter_interference",
@@ -1009,6 +1042,8 @@ def analyze_date(date_str, min_bvp_ab=8, recent_days=15, delay=0.15, use_statcas
             "expected_total_bases": scores["expected_total_bases"],
             "pa_reliability": scores["pa_reliability"],
             "low_pa_flag": scores["low_pa_flag"],
+            "combined_confidence": confidence_tier(scores["expected_combined"]),
+            "total_bases_confidence": confidence_tier(scores["expected_total_bases"]),
             "note": scores["note"],
         }
 
@@ -1065,17 +1100,19 @@ def run(date_str, min_bvp_ab, recent_days, delay, use_statcast, statcast_lookbac
     # of independent scores -- so a solo homer alone projects as high as 3).
     print_leaderboard(
         rows, "expected_combined", "TOP 10 PROJECTED H+R+RBI (expected combined count)",
-        extra_col=("  PROJ H/R/RBI",
-                   lambda r: f"  {r['expected_hits']:.2f}/{r['expected_runs']:.2f}/{r['expected_rbi']:.2f}"),
+        extra_col=("  TIER      PROJ H/R/RBI",
+                   lambda r: f"  {r['combined_confidence']:<10}{r['expected_hits']:.2f}/{r['expected_runs']:.2f}/{r['expected_rbi']:.2f}"),
     )
     print("(\u26a0 = getting notably fewer at-bats per game than their lineup slot would predict --"
           " platooning/part-time play risk. Not a substitution prediction, just a caution flag.)")
+    print("(TIER = confidence vs a 1.5 line, from backtested margin analysis: WEAK picks actually")
+    print(" underperformed a coin flip; only GOOD/STRONG cleared the typical -110 breakeven.)")
 
     # --- Total Bases: its own standalone prop, projected from slugging (not part
     # of the H+R+RBI combined number above) ---
     print_leaderboard(
         rows, "expected_total_bases", "TOP 10 PROJECTED TOTAL BASES",
-        extra_col=("  NOTE", lambda r: f"  {r['note']}"),
+        extra_col=("  TIER      NOTE", lambda r: f"  {r['total_bases_confidence']:<10}{r['note']}"),
     )
 
     # --- Individual category leaderboards ---

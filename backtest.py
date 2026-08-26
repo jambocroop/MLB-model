@@ -63,7 +63,8 @@ FIELDNAMES = [
     "recent_ab", "recent_games", "recent_avg", "recent_slg", "recent_runs_rate", "recent_rbi_rate",
     "hit_score", "run_score", "rbi_score", "combined_score",
     "expected_hits", "expected_runs", "expected_rbi", "expected_combined",
-    "expected_total_bases", "pa_reliability", "low_pa_flag", "note",
+    "expected_total_bases", "pa_reliability", "low_pa_flag",
+    "combined_confidence", "total_bases_confidence", "note",
     "actual_ab", "actual_h", "actual_r", "actual_rbi", "actual_combined", "actual_total_bases",
 ]
 
