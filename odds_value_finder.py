@@ -212,8 +212,8 @@ def find_value_bets(model_rows, api_key, markets, min_edge=0.05):
     name_index = build_name_index(model_rows)
     events = get_todays_mlb_events(api_key)
     if not events:
-        print("No MLB events found from Odds API (wrong date, off-season, or API issue).")
-        return []
+        print("No MLB events found from Odds API (wrong date, off-season, invalid API key, or API issue).")
+        return [], []
 
     print(f"Found {len(events)} MLB event(s) from Odds API.\n")
     results = []
