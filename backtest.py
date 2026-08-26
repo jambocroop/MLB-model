@@ -63,7 +63,7 @@ FIELDNAMES = [
     "recent_ab", "recent_games", "recent_avg", "recent_slg", "recent_runs_rate", "recent_rbi_rate",
     "hit_score", "run_score", "rbi_score", "combined_score",
     "expected_hits", "expected_runs", "expected_rbi", "expected_combined",
-    "expected_total_bases", "note",
+    "expected_total_bases", "pa_reliability", "low_pa_flag", "note",
     "actual_ab", "actual_h", "actual_r", "actual_rbi", "actual_combined", "actual_total_bases",
 ]
 
@@ -82,10 +82,12 @@ def _coerce_row_types(row):
                 "actual_ab", "actual_h", "actual_r", "actual_rbi", "actual_combined", "actual_total_bases"):
         row[key] = to_int(row.get(key))
     row["bvp_ab"] = to_int(row.get("bvp_ab")) or 0
+    row["low_pa_flag"] = str(row.get("low_pa_flag")).strip().lower() == "true"
     for key in ("bvp_avg", "bvp_slg", "bvp_runs_rate", "bvp_rbi_rate",
                 "statcast_similar_avg", "statcast_similar_slg",
                 "hand_split_avg", "hand_split_slg", "hand_split_runs_rate", "hand_split_rbi_rate",
                 "recent_avg", "recent_slg", "recent_runs_rate", "recent_rbi_rate",
+                "pa_reliability",
                 "hit_score", "run_score", "rbi_score", "combined_score",
                 "expected_hits", "expected_runs", "expected_rbi", "expected_combined", "expected_total_bases"):
         row[key] = to_float(row.get(key))
