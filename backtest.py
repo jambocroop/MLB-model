@@ -55,8 +55,12 @@ from mlb_daily_analysis import analyze_date, get_game_batting_actuals
 
 FIELDNAMES = [
     "date", "gamePk", "game", "batter_id", "batter", "team", "lineup_slot",
-    "opp_pitcher", "pitcher_hand", "bvp_ab", "bvp_avg", "statcast_similar_ab",
-    "statcast_similar_avg", "statcast_n_similar_pitchers", "recent_avg",
+    "opp_pitcher", "pitcher_hand",
+    "bvp_ab", "bvp_avg", "bvp_slg", "bvp_runs_rate", "bvp_rbi_rate",
+    "statcast_similar_ab", "statcast_similar_avg", "statcast_similar_slg",
+    "statcast_n_similar_pitchers",
+    "hand_split_ab", "hand_split_avg", "hand_split_slg", "hand_split_runs_rate", "hand_split_rbi_rate",
+    "recent_ab", "recent_games", "recent_avg", "recent_slg", "recent_runs_rate", "recent_rbi_rate",
     "hit_score", "run_score", "rbi_score", "combined_score",
     "expected_hits", "expected_runs", "expected_rbi", "expected_combined",
     "expected_total_bases", "note",
@@ -74,13 +78,16 @@ def _coerce_row_types(row):
         return None if v in (None, "") else int(float(v))
 
     for key in ("gamePk", "batter_id", "lineup_slot", "statcast_similar_ab",
-                "statcast_n_similar_pitchers", "actual_ab", "actual_h", "actual_r",
-                "actual_rbi", "actual_combined", "actual_total_bases"):
+                "statcast_n_similar_pitchers", "hand_split_ab", "recent_ab", "recent_games",
+                "actual_ab", "actual_h", "actual_r", "actual_rbi", "actual_combined", "actual_total_bases"):
         row[key] = to_int(row.get(key))
     row["bvp_ab"] = to_int(row.get("bvp_ab")) or 0
-    for key in ("bvp_avg", "statcast_similar_avg", "recent_avg", "hit_score", "run_score",
-                "rbi_score", "combined_score", "expected_hits", "expected_runs",
-                "expected_rbi", "expected_combined", "expected_total_bases"):
+    for key in ("bvp_avg", "bvp_slg", "bvp_runs_rate", "bvp_rbi_rate",
+                "statcast_similar_avg", "statcast_similar_slg",
+                "hand_split_avg", "hand_split_slg", "hand_split_runs_rate", "hand_split_rbi_rate",
+                "recent_avg", "recent_slg", "recent_runs_rate", "recent_rbi_rate",
+                "hit_score", "run_score", "rbi_score", "combined_score",
+                "expected_hits", "expected_runs", "expected_rbi", "expected_combined", "expected_total_bases"):
         row[key] = to_float(row.get(key))
     return row
 

@@ -849,6 +849,9 @@ def analyze_date(date_str, min_bvp_ab=8, recent_days=15, delay=0.15, use_statcas
 
         scores = score_batter(bvp, statcast_similar, hand_split, recent, t["slot"], min_bvp_ab)
 
+        def rate(split, key):
+            return round(split[key] / split["games"], 3) if split and split.get("games") else None
+
         return {
             "date": date_str,
             "gamePk": t["gamePk"],
@@ -859,12 +862,29 @@ def analyze_date(date_str, min_bvp_ab=8, recent_days=15, delay=0.15, use_statcas
             "lineup_slot": t["slot"],
             "opp_pitcher": t["pitcher_name"],
             "pitcher_hand": t["pitcher_hand"],
+            # --- raw per-tier components (needed to fit blend weights against
+            # actual outcomes, rather than guessing them) ---
             "bvp_ab": bvp["ab"] if bvp else 0,
             "bvp_avg": bvp["avg"] if bvp else None,
+            "bvp_slg": bvp["slg"] if bvp else None,
+            "bvp_runs_rate": rate(bvp, "runs"),
+            "bvp_rbi_rate": rate(bvp, "rbi"),
             "statcast_similar_ab": statcast_similar["ab"] if statcast_similar else None,
             "statcast_similar_avg": statcast_similar["avg"] if statcast_similar else None,
+            "statcast_similar_slg": statcast_similar["slg"] if statcast_similar else None,
             "statcast_n_similar_pitchers": statcast_similar["n_similar_pitchers"] if statcast_similar else None,
+            "hand_split_ab": hand_split["ab"] if hand_split else None,
+            "hand_split_avg": hand_split["avg"] if hand_split else None,
+            "hand_split_slg": hand_split["slg"] if hand_split else None,
+            "hand_split_runs_rate": rate(hand_split, "runs"),
+            "hand_split_rbi_rate": rate(hand_split, "rbi"),
+            "recent_ab": recent["ab"] if recent else None,
+            "recent_games": recent["games"] if recent else None,
             "recent_avg": recent["avg"] if recent else None,
+            "recent_slg": recent["slg"] if recent else None,
+            "recent_runs_rate": rate(recent, "runs"),
+            "recent_rbi_rate": rate(recent, "rbi"),
+            # --- model outputs (unchanged) ---
             "hit_score": scores["hit_score"],
             "run_score": scores["run_score"],
             "rbi_score": scores["rbi_score"],

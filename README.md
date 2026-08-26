@@ -154,3 +154,33 @@ Stats API is. If you hit errors or rate-limit responses, lower `--workers`;
 if it's running smoothly, you can push it higher. The old `--delay` flag no
 longer does anything (kept for backward compatibility) -- concurrency is
 now the throttle.
+
+## Fitting blend weights (fit_weights.py)
+```bash
+python fit_weights.py --csv backtest_2026-07-15_2026-08-21.csv
+python fit_weights.py --csv backtest_....csv --holdout-frac 0.25
+python fit_weights.py --csv backtest_....csv --split-date 2026-08-10
+```
+
+The blend weights in `score_batter()` (e.g. 65% BvP + 35% recent form) were
+originally hand-picked. This script replaces the guess with weights fit
+directly from backtest data, per tier (BvP-trusted vs hand-split-fallback),
+for each of Hits/Total Bases/Runs/RBI -- and validates the fit on a holdout
+slice of dates it never saw, so a fit isn't just memorizing one window.
+
+Requires a backtest CSV run with the current schema (raw per-tier component
+columns like `hand_split_avg`, `bvp_slg`, `recent_runs_rate`, etc. -- these
+were added after the original wide backtest, so **you'll need to delete old
+backtest CSVs and re-run `backtest.py` once** to get a CSV with the new
+columns before this will work).
+
+Output for each tier/metric: the fitted weights, and a head-to-head
+correlation comparison between the fitted model and the CURRENT hardcoded
+formula, both evaluated on the same holdout dates. Only adopt a fit into
+`score_batter()` if it (a) beats the current weights on holdout, not just
+train, and (b) has a reasonable holdout sample size -- the script flags
+tiers with fewer than 30 holdout rows as too thin to trust.
+
+Statcast-similar isn't fit (no data if your backtest used `--no-statcast`,
+which the wide one did) -- re-run a Statcast-enabled slice if you want that
+tier fit too.
