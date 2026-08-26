@@ -412,6 +412,21 @@ TOTAL_BASE_VALUES = {"single": 1, "double": 2, "triple": 3, "home_run": 4}
 EXPECTED_AB_PER_SLOT = {1: 4.6, 2: 4.5, 3: 4.4, 4: 4.3, 5: 4.2, 6: 4.1, 7: 4.0, 8: 3.9, 9: 3.7}
 LOW_PA_RELIABILITY_THRESHOLD = 0.75
 
+# Empirical recalibration for Runs/RBI, from backtest data (2026-07-16 to 2026-08-25,
+# n=9792). Both were found to be systematically LOW vs actual outcomes -- Runs
+# especially (average projected 0.180 vs average actual 0.427, a 2.4x gap). Likely
+# cause: the underlying BvP/hand-split "runs"/"rbi" rates are drawn from narrow,
+# matchup-specific samples that don't reflect a full game's run-scoring opportunity
+# the way recent-form's game-log rate does. These multipliers correct the average
+# LEVEL to match reality. IMPORTANT CAVEAT: this fixes the average, not necessarily
+# the ranking -- Runs' BvP-trusted tier specifically showed near-zero correlation
+# (r=0.044) in earlier analysis, meaning rescaling makes the average honest but does
+# not make that tier good at telling apart which specific player is more likely to
+# score. Re-derive these from a fresh backtest periodically rather than treating them
+# as permanent.
+RUNS_CALIBRATION_FACTOR = 2.375
+RBI_CALIBRATION_FACTOR = 1.288
+
 STATCAST_AB_EXCLUDE_EVENTS = {
     "walk", "hit_by_pitch", "sac_bunt", "sac_fly", "sac_fly_double_play",
     "catcher_interf", "intent_walk", "batter_interference",
@@ -725,13 +740,14 @@ def score_batter(bvp, statcast_similar, hand_split, recent, lineup_slot, min_bvp
         ab_per_game = recent["ab"] / recent["games"]
 
     expected_hits = round(ab_per_game * hit_component, 2)
-    expected_runs = round(_blend_rate(bvp, hand_split, recent, "runs", min_bvp_ab), 2)
+    expected_runs = round(_blend_rate(bvp, hand_split, recent, "runs", min_bvp_ab) * RUNS_CALIBRATION_FACTOR, 2)
     # RBI hand-split tier: fit_weights.py found a real, holdout-validated improvement
     # here (r 0.416 -> 0.512) -- adopted. Runs showed no meaningful gain, left as-is.
+    # Both also carry the empirical recalibration factor above (see constant comments).
     expected_rbi = round(_blend_rate(
         bvp, hand_split, recent, "rbi", min_bvp_ab,
         handsplit_tier_weights=(0.11, 0.15, 0.74),  # (hand_split, recent, bvp)
-    ), 2)
+    ) * RBI_CALIBRATION_FACTOR, 2)
     expected_combined = round(expected_hits + expected_runs + expected_rbi, 2)
     expected_total_bases = round(ab_per_game * slg_component, 2)
 
