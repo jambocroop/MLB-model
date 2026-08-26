@@ -184,3 +184,45 @@ tiers with fewer than 30 holdout rows as too thin to trust.
 Statcast-similar isn't fit (no data if your backtest used `--no-statcast`,
 which the wide one did) -- re-run a Statcast-enabled slice if you want that
 tier fit too.
+
+## Odds & Profitability (odds_value_finder.py)
+```bash
+export ODDS_API_KEY=your_key_here    # free key: https://the-odds-api.com/
+python odds_value_finder.py --date 2026-08-26
+python odds_value_finder.py --date 2026-08-26 --team "Dodgers,Yankees"   # cheaper on quota
+python odds_value_finder.py --csv mlb_report_2026-08-26.csv              # reuse an existing run
+```
+
+Matches the model's projections against LIVE sportsbook player prop odds
+and surfaces bets where the model's implied probability meaningfully beats
+what the market is pricing.
+
+**Markets used** (via The Odds API): `batter_hits`, `batter_total_bases`,
+`batter_rbis`, `batter_runs_scored`, and `batter_hits_runs_rbis` -- the last
+one is the exact combined prop this model already projects as
+`expected_combined`.
+
+**How a point projection becomes a probability**: sportsbook lines are
+over/under a number, but the model outputs a single expected value (e.g.
+"1.8 total bases"), not a probability. This script converts:
+- Hits: Binomial(n=at-bats-per-game, p=hit-probability-per-AB) -- both are
+  already available from the model, and hits are naturally capped by AB.
+- Total Bases / Runs / RBI / Combined: Poisson(lambda=projection) -- a
+  standard approximation for count-like stats. Not exact, but reasonable
+  without a fitted distribution.
+
+**De-vigging**: when both Over and Under prices are available, they're
+normalized to sum to 1 for a fairer "true" market probability (raw implied
+probability includes the book's built-in margin).
+
+**Cost**: [markets requested] x [regions] credits per game on Odds API's
+free 500-credit/month tier. All 5 markets x 1 region = 5 credits/game --
+~75 for a full 15-game slate, so roughly 6-7 full-slate days/month free.
+Use `--team` to scope to specific games and stretch the quota much further.
+
+**Important limitation**: historical player prop odds require a PAID Odds
+API plan. This script only works with current/live odds -- it can't
+retroactively backtest profitability against real historical lines. The
+free path to validating profitability is prospective: run this daily going
+forward and track actual results against the odds offered that day, rather
+than backtesting.
