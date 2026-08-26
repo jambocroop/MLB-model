@@ -555,21 +555,33 @@ def _rate_per_game(split, key):
     return split[key] / split["games"]
 
 
-def _blend_rate(bvp, hand_split, recent, key, min_bvp_ab):
+def _blend_rate(bvp, hand_split, recent, key, min_bvp_ab,
+                 bvp_tier_weights=(0.65, 0.35), handsplit_tier_weights=(0.45, 0.30, 0.25)):
     """
     Same priority chain as the hit-probability blend (BvP > hand-split > recent),
     but for a raw per-game counting rate (runs or rbi) instead of a batting average.
     No Statcast-similar tier here -- the Statcast pitch log doesn't cleanly give us
     runs/RBI per PA, so that tier is skipped for this metric (falls to hand-split).
+
+    Weights are parameterized (rather than hardcoded) because Runs and RBI were
+    fit separately against backtest data and came back with different answers:
+    Runs showed no meaningful improvement over the original guess (kept as-is),
+    RBI's hand-split tier showed a real, holdout-validated gain -- so only RBI's
+    call site below overrides handsplit_tier_weights.
+
+    bvp_tier_weights: (w_bvp, w_recent)
+    handsplit_tier_weights: (w_hand_split, w_recent, w_bvp)
     """
     bvp_rate = _rate_per_game(bvp, key)
     hand_rate = _rate_per_game(hand_split, key)
     recent_rate = _rate_per_game(recent, key) or 0.0
 
     if bvp and bvp["ab"] >= min_bvp_ab and bvp_rate is not None:
-        return 0.65 * bvp_rate + 0.35 * recent_rate
+        w_bvp, w_recent = bvp_tier_weights
+        return w_bvp * bvp_rate + w_recent * recent_rate
     elif hand_split and hand_split["ab"] >= min_bvp_ab and hand_rate is not None:
-        return 0.45 * hand_rate + 0.30 * recent_rate + 0.25 * (bvp_rate or 0.0)
+        w_hand, w_recent, w_bvp = handsplit_tier_weights
+        return w_hand * hand_rate + w_recent * recent_rate + w_bvp * (bvp_rate or 0.0)
     else:
         return recent_rate
 
@@ -617,7 +629,11 @@ def score_batter(bvp, statcast_similar, hand_split, recent, lineup_slot, min_bvp
                 f"pitchers ({statcast_similar['n_similar_pitchers']} pitchers, "
                 f"{statcast_similar['ab']} AB, {statcast_similar['avg']:.3f})")
     elif hand_split and hand_split["ab"] >= min_bvp_ab:
-        hit_component = 0.45 * hand_split["avg"] + 0.30 * recent_avg + 0.25 * bvp_avg
+        # Weights fit from backtest data (fit_weights.py): hand_split=0.37, recent=0.18,
+        # bvp=0.45 -- real, holdout-validated improvement over the original 0.45/0.30/0.25
+        # guess (r 0.450 -> 0.493). Notably, even a thin BvP sample carries more signal
+        # here than the original weighting gave it credit for.
+        hit_component = 0.37 * hand_split["avg"] + 0.18 * recent_avg + 0.45 * bvp_avg
         note = f"BvP/Statcast-similar too small -- used vs-hand split ({hand_split['ab']} AB, {hand_split['avg']:.3f}) as proxy"
     else:
         hit_component = recent_avg
@@ -635,7 +651,9 @@ def score_batter(bvp, statcast_similar, hand_split, recent, lineup_slot, min_bvp
     elif statcast_similar and statcast_similar["ab"] >= min_bvp_ab:
         slg_component = 0.50 * statcast_similar["slg"] + 0.30 * recent_slg + 0.20 * bvp_slg
     elif hand_split and hand_split["ab"] >= min_bvp_ab:
-        slg_component = 0.45 * hand_split["slg"] + 0.30 * recent_slg + 0.25 * bvp_slg
+        # Fitted weights (fit_weights.py): hand_split=0.31, recent=0.17, bvp=0.52 --
+        # real improvement over the original 0.45/0.30/0.25 guess (r 0.494 -> 0.542).
+        slg_component = 0.31 * hand_split["slg"] + 0.17 * recent_slg + 0.52 * bvp_slg
     else:
         slg_component = recent_slg
 
@@ -665,7 +683,12 @@ def score_batter(bvp, statcast_similar, hand_split, recent, lineup_slot, min_bvp
 
     expected_hits = round(ab_per_game * hit_component, 2)
     expected_runs = round(_blend_rate(bvp, hand_split, recent, "runs", min_bvp_ab), 2)
-    expected_rbi = round(_blend_rate(bvp, hand_split, recent, "rbi", min_bvp_ab), 2)
+    # RBI hand-split tier: fit_weights.py found a real, holdout-validated improvement
+    # here (r 0.416 -> 0.512) -- adopted. Runs showed no meaningful gain, left as-is.
+    expected_rbi = round(_blend_rate(
+        bvp, hand_split, recent, "rbi", min_bvp_ab,
+        handsplit_tier_weights=(0.11, 0.15, 0.74),  # (hand_split, recent, bvp)
+    ), 2)
     expected_combined = round(expected_hits + expected_runs + expected_rbi, 2)
     expected_total_bases = round(ab_per_game * slg_component, 2)
 
