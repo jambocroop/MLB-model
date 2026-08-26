@@ -118,13 +118,21 @@ def normalize_weights(coefs):
 
 
 def fit_and_evaluate(train, holdout, feature_keys, target_key, tier_filter, label,
-                      current_model_key, min_rows=30):
+                      current_model_key, min_rows=30, min_improvement=0.03, weak_signal_threshold=0.10):
     """
     feature_keys: list of column names to use as predictors (missing -> 0).
     target_key: column name of the actual outcome to predict.
     tier_filter: function(row) -> bool, selects rows belonging to this tier.
     current_model_key: column with the CURRENT hardcoded-weight projection,
                         for a fair head-to-head comparison on holdout.
+    min_improvement: fitted must beat current by at least this much correlation
+                      on holdout to be worth adopting -- a razor-thin edge (0.01-0.02)
+                      is well within normal sampling noise and not a real signal
+                      that the new weights are actually better.
+    weak_signal_threshold: if BOTH fitted and current holdout correlation are
+                            below this, the problem isn't the weights -- neither
+                            blend has real predictive power for this tier/metric,
+                            and reweighting the same inputs won't fix that.
     """
     train_rows = [r for r in train if tier_filter(r)]
     holdout_rows = [r for r in holdout if tier_filter(r)]
@@ -162,12 +170,30 @@ def fit_and_evaluate(train, holdout, feature_keys, target_key, tier_filter, labe
 
     print(f"  HOLDOUT -- fitted:  r={fmt(r_fitted)}  MAE={fmt(mae_fitted)}")
     print(f"  HOLDOUT -- current: r={fmt(r_current)}  MAE={fmt(mae_current)}")
-    better = r_fitted is not None and r_current is not None and r_fitted > r_current
-    print(f"  {'-> Fitted weights beat current on holdout.' if better else '-> Current weights hold up fine; fit not worth adopting yet.'}\n")
+
+    weak_signal = (r_fitted is not None and r_current is not None and
+                    max(r_fitted, r_current) < weak_signal_threshold)
+    meaningful_gain = (r_fitted is not None and r_current is not None and
+                        (r_fitted - r_current) >= min_improvement)
+
+    if weak_signal:
+        verdict = "weak_signal"
+        print(f"  -> WEAK SIGNAL: even the better of the two barely beats zero correlation. "
+              f"This isn't a weighting problem -- these inputs don't predict this outcome well "
+              f"in this tier. Reweighting won't fix it; the inputs themselves need to change.\n")
+    elif meaningful_gain:
+        verdict = "adopt"
+        print(f"  -> Fitted weights beat current by a real margin (+{r_fitted - r_current:.3f}) -- worth adopting.\n")
+    else:
+        verdict = "keep_current"
+        gap = r_fitted - r_current if (r_fitted is not None and r_current is not None) else None
+        gap_str = f"+{gap:.3f}" if gap is not None else "n/a"
+        print(f"  -> Gap too small to trust ({gap_str}, threshold is {min_improvement}) -- "
+              f"likely noise, not a real improvement. Keep current weights.\n")
 
     return {
         "label": label, "feature_keys": feature_keys, "weights": weights,
-        "r_fitted": r_fitted, "r_current": r_current, "adopt": better,
+        "r_fitted": r_fitted, "r_current": r_current, "verdict": verdict,
         "n_train": len(train_rows), "n_holdout": len(holdout_rows),
     }
 
@@ -225,14 +251,18 @@ def main(csv_path, holdout_frac, split_date, min_bvp_ab):
     print("=" * 70)
     print("SUMMARY")
     print("=" * 70)
+    tag_labels = {"adopt": "ADOPT", "keep_current": "keep current", "weak_signal": "WEAK SIGNAL"}
     for res in results:
         if res is None:
             continue
-        tag = "ADOPT" if res["adopt"] else "keep current"
+        tag = tag_labels[res["verdict"]]
         weight_str = ", ".join(f"{k}={w:.2f}" for k, w in zip(res["feature_keys"], res["weights"]))
         rf = format(res["r_fitted"], ".3f") if res["r_fitted"] is not None else "n/a"
         rc = format(res["r_current"], ".3f") if res["r_current"] is not None else "n/a"
         print(f"[{tag:12}] {res['label']:<40} fitted r={rf} vs current r={rc}  ({weight_str})")
+    print("\nNote: WEAK SIGNAL means neither weighting predicts that outcome well in that tier --")
+    print("that's a signal the model needs better *inputs* there (e.g. real team-offense context")
+    print("for runs/RBI), not just different weights on the same inputs.")
 
 
 if __name__ == "__main__":
