@@ -412,20 +412,24 @@ TOTAL_BASE_VALUES = {"single": 1, "double": 2, "triple": 3, "home_run": 4}
 EXPECTED_AB_PER_SLOT = {1: 4.6, 2: 4.5, 3: 4.4, 4: 4.3, 5: 4.2, 6: 4.1, 7: 4.0, 8: 3.9, 9: 3.7}
 LOW_PA_RELIABILITY_THRESHOLD = 0.75
 
-# Empirical recalibration for Runs/RBI, from backtest data (2026-07-16 to 2026-08-25,
-# n=9792). Both were found to be systematically LOW vs actual outcomes -- Runs
-# especially (average projected 0.180 vs average actual 0.427, a 2.4x gap). Likely
-# cause: the underlying BvP/hand-split "runs"/"rbi" rates are drawn from narrow,
-# matchup-specific samples that don't reflect a full game's run-scoring opportunity
-# the way recent-form's game-log rate does. These multipliers correct the average
-# LEVEL to match reality. IMPORTANT CAVEAT: this fixes the average, not necessarily
-# the ranking -- Runs' BvP-trusted tier specifically showed near-zero correlation
-# (r=0.044) in earlier analysis, meaning rescaling makes the average honest but does
-# not make that tier good at telling apart which specific player is more likely to
-# score. Re-derive these from a fresh backtest periodically rather than treating them
-# as permanent.
-RUNS_CALIBRATION_FACTOR = 2.375
-RBI_CALIBRATION_FACTOR = 1.288
+# Empirical recalibration for Runs/RBI, from backtest data (2026-07-16 to 2026-08-25).
+# Both were found systematically LOW vs actual outcomes in the BvP-trusted and
+# hand-split tiers specifically -- likely because the underlying BvP/hand-split
+# "runs"/"rbi" rates are drawn from narrow, matchup-specific samples that don't
+# reflect a full game's scoring opportunity the way recent-form's game-log rate does.
+#
+# IMPORTANT: a first pass at this used ONE flat global factor applied everywhere,
+# fit from the overall average across all tiers. That was a mistake, caught by
+# re-backtesting: the recent-form-only fallback tier (used for players with no
+# BvP/hand-split history at all -- rookies, call-ups) was already close to correct
+# on its own, since it doesn't touch the biased BvP/hand-split fields. Applying the
+# same multiplier there anyway blew up small, noisy samples into absurd single-game
+# projections (one case hit 7.12 expected runs). Factors are now tier-specific, and
+# the recent-only tier gets none at all. Re-derive periodically from a fresh
+# backtest rather than treating these as permanent -- and re-check the tier
+# breakdown specifically, not just the overall average, before trusting a refit.
+RUNS_CALIBRATION_BY_TIER = {"bvp": 2.75, "handsplit": 2.93, "recent_only": 1.0}
+RBI_CALIBRATION_BY_TIER = {"bvp": 1.34, "handsplit": 1.33, "recent_only": 1.0}
 
 STATCAST_AB_EXCLUDE_EVENTS = {
     "walk", "hit_by_pitch", "sac_bunt", "sac_fly", "sac_fly_double_play",
@@ -605,7 +609,8 @@ def _confidence_scaled_handsplit_weights(bvp_ab, min_bvp_ab, base_weights):
 
 
 def _blend_rate(bvp, hand_split, recent, key, min_bvp_ab,
-                 bvp_tier_weights=(0.65, 0.35), handsplit_tier_weights=(0.45, 0.30, 0.25)):
+                 bvp_tier_weights=(0.65, 0.35), handsplit_tier_weights=(0.45, 0.30, 0.25),
+                 calibration_by_tier=None):
     """
     Same priority chain as the hit-probability blend (BvP > hand-split > recent),
     but for a raw per-game counting rate (runs or rbi) instead of a batting average.
@@ -620,20 +625,24 @@ def _blend_rate(bvp, hand_split, recent, key, min_bvp_ab,
 
     bvp_tier_weights: (w_bvp, w_recent)
     handsplit_tier_weights: (w_hand_split, w_recent, w_bvp)
+    calibration_by_tier: optional dict {"bvp": x, "handsplit": y, "recent_only": z} --
+    empirical multipliers applied AFTER the blend, PER TIER (not globally -- see the
+    comment on RUNS_CALIBRATION_BY_TIER for why that distinction matters).
     """
+    cal = calibration_by_tier or {"bvp": 1.0, "handsplit": 1.0, "recent_only": 1.0}
     bvp_rate = _rate_per_game(bvp, key)
     hand_rate = _rate_per_game(hand_split, key)
     recent_rate = _rate_per_game(recent, key) or 0.0
 
     if bvp and bvp["ab"] >= min_bvp_ab and bvp_rate is not None:
         w_bvp, w_recent = bvp_tier_weights
-        return w_bvp * bvp_rate + w_recent * recent_rate
+        return (w_bvp * bvp_rate + w_recent * recent_rate) * cal["bvp"]
     elif hand_split and hand_split["ab"] >= min_bvp_ab and hand_rate is not None:
         bvp_ab_n = bvp["ab"] if bvp else 0
         w_hand, w_recent, w_bvp = _confidence_scaled_handsplit_weights(bvp_ab_n, min_bvp_ab, handsplit_tier_weights)
-        return w_hand * hand_rate + w_recent * recent_rate + w_bvp * (bvp_rate or 0.0)
+        return (w_hand * hand_rate + w_recent * recent_rate + w_bvp * (bvp_rate or 0.0)) * cal["handsplit"]
     else:
-        return recent_rate
+        return recent_rate * cal["recent_only"]
 
 
 def score_batter(bvp, statcast_similar, hand_split, recent, lineup_slot, min_bvp_ab=8):
@@ -740,14 +749,19 @@ def score_batter(bvp, statcast_similar, hand_split, recent, lineup_slot, min_bvp
         ab_per_game = recent["ab"] / recent["games"]
 
     expected_hits = round(ab_per_game * hit_component, 2)
-    expected_runs = round(_blend_rate(bvp, hand_split, recent, "runs", min_bvp_ab) * RUNS_CALIBRATION_FACTOR, 2)
+    expected_runs = round(_blend_rate(
+        bvp, hand_split, recent, "runs", min_bvp_ab,
+        calibration_by_tier=RUNS_CALIBRATION_BY_TIER,
+    ), 2)
     # RBI hand-split tier: fit_weights.py found a real, holdout-validated improvement
     # here (r 0.416 -> 0.512) -- adopted. Runs showed no meaningful gain, left as-is.
-    # Both also carry the empirical recalibration factor above (see constant comments).
+    # Both also carry the empirical per-tier recalibration above (see constant comments
+    # on RUNS_CALIBRATION_BY_TIER / RBI_CALIBRATION_BY_TIER -- NOT a flat global factor).
     expected_rbi = round(_blend_rate(
         bvp, hand_split, recent, "rbi", min_bvp_ab,
         handsplit_tier_weights=(0.11, 0.15, 0.74),  # (hand_split, recent, bvp)
-    ) * RBI_CALIBRATION_FACTOR, 2)
+        calibration_by_tier=RBI_CALIBRATION_BY_TIER,
+    ), 2)
     expected_combined = round(expected_hits + expected_runs + expected_rbi, 2)
     expected_total_bases = round(ab_per_game * slg_component, 2)
 
