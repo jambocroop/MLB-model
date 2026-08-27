@@ -226,3 +226,48 @@ retroactively backtest profitability against real historical lines. The
 free path to validating profitability is prospective: run this daily going
 forward and track actual results against the odds offered that day, rather
 than backtesting.
+
+## Squad Builder (squad_builder.py)
+```bash
+python squad_builder.py --date 2026-08-26                          # mixed pool, both stats, default 1.5 lines
+python squad_builder.py --date 2026-08-26 --combined-line 2.5 --total-bases-line 1.5
+python squad_builder.py --date 2026-08-26 --metric total_bases      # restrict to just one stat
+python squad_builder.py --csv mlb_report_2026-08-26.csv
+python squad_builder.py --date 2026-08-26 --squad-size 6 --max-per-game 1
+```
+
+By default, builds squads from a MIXED pool of both Hits+Runs+RBIs picks and
+Total Bases picks for every batter (each is a separate "pick" -- a slip
+is really 4 picks, not 4 players) -- so the same player can legitimately
+fill two slots if both his picks rank highly (e.g. Ohtani's Combined pick
+AND his Total Bases pick both in one squad). That is intended, not a bug:
+the tool actively flags it in the squad output as a distinct, stronger
+correlation warning than the ordinary same-game one, since two picks on
+the literal same player share the exact same at-bats. Use `--metric
+combined` or `--metric total_bases` to restrict to a single stat if you
+want single-metric squads instead.
+
+**Game-total prioritization**: set `ODDS_API_KEY` (same key as `odds_value_finder.py`)
+to enable a squad built by GAME first (highest Over/Under total-runs line =
+most expected offense), then best player(s) within each -- rather than
+ranking players first and diversifying as an afterthought. Costs just 1
+credit for the whole day's slate (uses the cheap bulk totals endpoint, not
+the per-event player-props one). Optional -- everything else still works
+fine without an API key, you just won't get this specific squad option.
+
+For "pick N players, all must clear the line" formats (Underdog/PrizePicks-style
+pick'ems) rather than single best picks or odds-based value bets. Converts
+every batter's projection into P(actual > line) using the same Poisson math
+validated in `odds_value_finder.py`, ranks everyone, and for a fixed squad
+size the best joint probability is just the top-N by individual probability
+(mathematically provable, and verified against brute force in testing).
+
+Also builds a `--max-per-game`-diversified squad (default caps at 2 players
+per game) and a few non-overlapping alternative squads, since two players
+from the same game are NOT independent in real life.
+
+**Read the caveat in the file docstring before trusting the joint probability
+number** — it's a product of individual probabilities assuming independence,
+which understates same-game correlation (both the extra risk and the extra
+upside). Use it to compare candidate squads against each other, not as a
+precise number on its own.
