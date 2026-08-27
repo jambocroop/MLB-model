@@ -184,6 +184,44 @@ def get_event_player_odds(event_id, markets, api_key):
     )
 
 
+def get_game_totals(api_key, regions="us"):
+    """
+    Fetch today's MLB game totals (the Over/Under total-runs line) for ALL games
+    in ONE call. This uses the bulk "featured markets" endpoint (h2h/spreads/
+    totals), NOT the per-event player-props endpoint -- costs just 1 credit
+    (markets=1 x regions=1) for the entire day's slate, dramatically cheaper
+    than player props. A higher total implies the market expects more scoring
+    (offense-friendly park/weather/pitching matchups), useful as a signal for
+    which GAMES to prioritize before picking which players within them.
+
+    Returns a list of {home_team, away_team, total} dicts (consensus total,
+    averaged across whichever books offered a totals line for that game).
+    """
+    data = odds_api_get(
+        "/sports/baseball_mlb/odds", api_key,
+        params={"regions": regions, "markets": "totals", "oddsFormat": "american"},
+    )
+    if not data:
+        return []
+    results = []
+    for event in data:
+        lines = []
+        for bookmaker in event.get("bookmakers", []):
+            for market in bookmaker.get("markets", []):
+                if market.get("key") != "totals":
+                    continue
+                for outcome in market.get("outcomes", []):
+                    if outcome.get("point") is not None:
+                        lines.append(outcome["point"])
+        if lines:
+            results.append({
+                "home_team": event.get("home_team"),
+                "away_team": event.get("away_team"),
+                "total": round(sum(lines) / len(lines), 2),
+            })
+    return results
+
+
 # ---------------------------------------------------------------------------
 # Name matching (odds API player names vs MLB Stats API batter names)
 # ---------------------------------------------------------------------------
