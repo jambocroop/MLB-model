@@ -243,7 +243,16 @@ fill two slots if both his picks rank highly (e.g. Ohtani's Combined pick
 AND his Total Bases pick both in one squad). That is intended, not a bug:
 the tool actively flags it in the squad output as a distinct, stronger
 correlation warning than the ordinary same-game one, since two picks on
-the literal same player share the exact same at-bats. Use `--metric
+the literal same player share the exact same at-bats.
+
+**Correlation-adjusted joint probability**: the tool now shows TWO numbers per
+squad -- naive independence and a correlation-adjusted version -- using
+correlations measured directly from backtest data (2026-07-16 to 2026-08-25):
+same-player-both-stats correlation is ~0.71 (their outcomes share the same
+at-bats), same-game-different-player correlation is much smaller (~0.01-0.04),
+and different-game pairs measured near 0 (confirming independence is
+reasonable across games). Re-measure periodically from a fresh backtest --
+these are empirical, not permanent constants. Use `--metric
 combined` or `--metric total_bases` to restrict to a single stat if you
 want single-metric squads instead.
 

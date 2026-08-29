@@ -50,6 +50,7 @@ USAGE:
 
 import argparse
 import csv
+import math
 import os
 from datetime import datetime
 
@@ -104,10 +105,82 @@ def compute_probabilities(rows, metrics, lines):
 
 
 def joint_probability(squad):
+    """Naive independence assumption -- product of individual probabilities.
+    Kept around for comparison against the correlation-adjusted version below."""
     p = 1.0
     for player in squad:
         p *= player["prob"]
     return p
+
+
+# Empirically measured pairwise correlations (Pearson, on the binary "cleared
+# the line" outcome), from backtest data 2026-07-16 to 2026-08-25:
+#   - Same-game, different-player pairs: n=83,232 pairs per metric
+#   - Same-player, both-stats pairs (his Combined pick vs his Total Bases pick,
+#     same game): n=9,792
+#   - Different-game pairs (sanity check): correlation -0.005, essentially 0 --
+#     confirms independence is a reasonable assumption ACROSS games.
+# The same-player number is dramatically higher than same-game-different-player,
+# which makes sense: Total Bases literally feeds into Combined for one player's
+# own at-bats, so their outcomes share the same underlying events. Same-game
+# different-player correlation is real but much smaller than intuition might
+# suggest -- individual at-bat variance dominates over the shared team-offense
+# signal. Re-measure periodically from a fresh backtest; these aren't permanent.
+SAME_GAME_CORRELATION = {"combined": 0.040, "total_bases": 0.013}
+SAME_PLAYER_CORRELATION = 0.709
+
+
+def get_pairwise_rho(pick_a, pick_b):
+    """Empirical correlation between two picks' binary clear/no-clear outcomes."""
+    if pick_a["batter"] == pick_b["batter"]:
+        return SAME_PLAYER_CORRELATION  # can only differ by metric -- pool has 1 entry/metric/player
+    if pick_a["game"] == pick_b["game"]:
+        # Different metrics in the same game: use the higher (more conservative) of
+        # the two same-game correlations rather than picking one arbitrarily.
+        return max(SAME_GAME_CORRELATION.get(pick_a["metric"], 0.0),
+                   SAME_GAME_CORRELATION.get(pick_b["metric"], 0.0))
+    return 0.0  # different games: measured near 0, treat as independent
+
+
+def _binary_joint_prob(p_x, p_y, rho):
+    """P(X=1, Y=1) for correlated Bernoulli X, Y with given marginals and correlation,
+    clamped to the Frechet bounds so an edge-case rho/probability combination can't
+    produce an invalid (negative or >1) probability."""
+    cov = rho * math.sqrt(max(0.0, p_x * (1 - p_x)) * max(0.0, p_y * (1 - p_y)))
+    joint = p_x * p_y + cov
+    lo, hi = max(0.0, p_x + p_y - 1.0), min(p_x, p_y)
+    return max(lo, min(hi, joint))
+
+
+def correlated_joint_probability(squad):
+    """
+    Correlation-adjusted joint probability, using the empirical rho values above
+    instead of assuming independence. Approximation for squads with 3+ mutually
+    correlated picks (this uses each new pick's SINGLE strongest correlation with
+    an already-included pick, not a full multivariate model) -- but captures the
+    dominant pairwise effects that matter at squad sizes around 4, and is exact
+    for the common 2-correlated-picks case.
+    """
+    if not squad:
+        return 1.0
+    included = []
+    joint = squad[0]["prob"]
+    included.append(squad[0])
+    for pick in squad[1:]:
+        best_rho, best_prev = 0.0, None
+        for prev in included:
+            rho = get_pairwise_rho(prev, pick)
+            if abs(rho) > abs(best_rho):
+                best_rho, best_prev = rho, prev
+        if best_prev is not None and best_rho != 0.0:
+            p_x = best_prev["prob"]
+            pair_joint = _binary_joint_prob(p_x, pick["prob"], best_rho)
+            conditional_p = pair_joint / p_x if p_x > 0 else pick["prob"]
+            joint *= max(0.0, min(1.0, conditional_p))
+        else:
+            joint *= pick["prob"]
+        included.append(pick)
+    return max(0.0, min(1.0, joint))
 
 
 def match_game_total(game_str, totals):
@@ -228,18 +301,21 @@ def print_squad(squad, label, squad_size):
     if len(squad) < squad_size:
         print(f"\n{label}: only {len(squad)}/{squad_size} candidates available -- not enough eligible players.")
         return
-    jp = joint_probability(squad)
+    jp_naive = joint_probability(squad)
+    jp_adjusted = correlated_joint_probability(squad)
     games_used = len(set(p["game"] for p in squad))
     players_used = len(set(p["batter"] for p in squad))
     notes = []
     if players_used < len(squad):
-        notes.append(f"only {players_used} distinct players -- same player picked for both stats at least once, "
-                      f"maximally correlated (same at-bats drive both outcomes)")
+        notes.append(f"only {players_used} distinct players -- same player picked for both stats at least once "
+                      f"(measured correlation ~{SAME_PLAYER_CORRELATION:.2f}, same at-bats drive both outcomes)")
     elif games_used < len(squad):
-        notes.append(f"only {games_used} distinct games -- correlated risk")
+        notes.append(f"only {games_used} distinct games (measured same-game correlation is real but modest, "
+                      f"~0.01-0.04 -- see correlation-adjusted probability below)")
     diversity_note = f"  (\u26a0 {'; '.join(notes)})" if notes else ""
     print(f"\n{label}")
-    print(f"  Joint probability (assumes independence): {jp:.1%}{diversity_note}")
+    print(f"  Joint probability -- naive independence:    {jp_naive:.1%}")
+    print(f"  Joint probability -- correlation-adjusted:  {jp_adjusted:.1%}{diversity_note}")
     print("  " + "-" * 76)
     for p in squad:
         total_str = f"  O/U={p['game_total']}" if p.get("game_total") is not None else ""

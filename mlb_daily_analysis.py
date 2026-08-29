@@ -412,6 +412,22 @@ TOTAL_BASE_VALUES = {"single": 1, "double": 2, "triple": 3, "home_run": 4}
 EXPECTED_AB_PER_SLOT = {1: 4.6, 2: 4.5, 3: 4.4, 4: 4.3, 5: 4.2, 6: 4.1, 7: 4.0, 8: 3.9, 9: 3.7}
 LOW_PA_RELIABILITY_THRESHOLD = 0.75
 
+# Shrinkage for the AB-per-game figure used IN PROJECTIONS (expected_hits,
+# expected_total_bases) -- found via backtest validation (2026-07-16 to
+# 2026-08-25): using the raw recent-games trailing average directly, with no
+# shrinkage, caused a real and statistically robust bias. Players flagged as
+# low-PA-reliability (a real, thin recent sample) BEAT their own projection by
+# +0.155-0.160 on average (z=5.7-6.8, not noise) -- the model was extrapolating
+# a short-term dip in playing time at full strength, when reality tends to
+# regress partway back toward normal. This blends the raw recent average
+# toward the slot's expected-AB baseline, trusting the raw average more as the
+# recent sample (games played) grows -- full trust once recent_games reaches
+# this many. NOTE: this shrinkage applies ONLY to the projection math below --
+# the PA reliability FLAG itself still uses the raw (unshrunk) average, since
+# that flag's whole job is to accurately surface a real recent dip, not to
+# smooth it away.
+AB_SHRINKAGE_FULL_TRUST_GAMES = 12
+
 # Empirical recalibration for Runs/RBI, from backtest data (2026-07-16 to 2026-08-25).
 # Both were found systematically LOW vs actual outcomes in the BvP-trusted and
 # hand-split tiers specifically -- likely because the underlying BvP/hand-split
@@ -777,9 +793,18 @@ def score_batter(bvp, statcast_similar, hand_split, recent, lineup_slot, min_bvp
     combined_score = round((hit_score + run_score + rbi_score) / 3, 1)
 
     # --- Real expected-count projections (the "Hits+Runs+RBIs" prop equivalent) ---
-    ab_per_game = 4.0  # league-average default
+    expected_ab_for_slot = EXPECTED_AB_PER_SLOT.get(lineup_slot, 4.0)
+    raw_ab_per_game = 4.0  # league-average default
     if recent and recent.get("games"):
-        ab_per_game = recent["ab"] / recent["games"]
+        raw_ab_per_game = recent["ab"] / recent["games"]
+
+    # Shrink the raw recent-games average toward the slot baseline for
+    # PROJECTION purposes -- see AB_SHRINKAGE_FULL_TRUST_GAMES comment for why.
+    if recent and recent.get("games"):
+        shrink_confidence = min(1.0, recent["games"] / AB_SHRINKAGE_FULL_TRUST_GAMES)
+    else:
+        shrink_confidence = 0.0
+    ab_per_game = shrink_confidence * raw_ab_per_game + (1 - shrink_confidence) * expected_ab_for_slot
 
     expected_hits = round(ab_per_game * hit_component, 2)
     expected_runs = round(_blend_rate(
@@ -805,12 +830,12 @@ def score_batter(bvp, statcast_similar, hand_split, recent, lineup_slot, min_bvp
     # projections above: a batter getting notably fewer at-bats per game
     # than their lineup slot would predict is a real signal of platooning,
     # early removal, or part-time play -- worth knowing before trusting a
-    # high projection, even though we don't touch the projection itself.
-    expected_ab_for_slot = EXPECTED_AB_PER_SLOT.get(lineup_slot, 4.0)
+    # high projection. Uses the RAW (unshrunk) average deliberately -- this
+    # flag's job is to accurately surface a real recent dip, not smooth it.
     pa_reliability = None
     low_pa_flag = False
     if recent and recent.get("games"):
-        pa_reliability = round(min(1.0, ab_per_game / expected_ab_for_slot), 2)
+        pa_reliability = round(min(1.0, raw_ab_per_game / expected_ab_for_slot), 2)
         low_pa_flag = pa_reliability < LOW_PA_RELIABILITY_THRESHOLD
 
     return {
