@@ -9,10 +9,10 @@ the script still runs without them, just falls back to hand-split matching.)
 
 ## Run
 ```bash
-python mlb_daily_analysis.py                      # today's games, with Statcast
+python mlb_daily_analysis.py                      # today's games (Statcast OFF by default -- see below)
 python mlb_daily_analysis.py --date 2026-08-22     # specific date
 python mlb_daily_analysis.py --min-bvp-ab 10       # require 10+ ABs before trusting a sample
-python mlb_daily_analysis.py --no-statcast         # skip Statcast, much faster
+python mlb_daily_analysis.py --use-statcast        # opt in to Statcast (slower, backtested as slightly worse)
 python mlb_daily_analysis.py --similarity-threshold 0.9   # stricter pitcher matching
 python mlb_daily_analysis.py --team Dodgers                # scope to one game, fast test run
 ```
@@ -50,6 +50,21 @@ python mlb_daily_analysis.py --team Dodgers                # scope to one game, 
    saves a full CSV with every field, including which data source each
    batter's score leaned on.
 
+## Statcast similarity status: OFF by default, opt-in only
+A head-to-head backtest (2026-08-18 to 2026-08-24, n=1,158 matched player-dates
+where the Statcast-similar tier actually fired) found it performed slightly
+WORSE than the simpler hand-split fallback on both metrics:
+- Hits: r=0.374 (Statcast) vs r=0.394 (hand-split alone)
+- Total Bases: r=0.296 (Statcast) vs r=0.350 (hand-split alone)
+
+Likely cause: the "similar pitcher" pool averaged 142 pitchers (up to 290) --
+far too broad to represent genuine repertoire similarity, closer to "the
+league-average pitcher" than a targeted match. The code is kept, not deleted,
+in case a much stricter `--similarity-threshold` (try 0.95+) is worth testing
+later, but it's opt-in (`--use-statcast`) rather than the default path. It's
+also just plain slow -- `pybaseball` scrapes Baseball Savant, capped at 4
+concurrent calls regardless of `--workers`.
+
 ## How the Statcast similarity works (v2)
 - Pulls the *target* pitcher's own pitch log for the lookback window
   (default ~395 days) and buckets pitches into Fastball / Breaking /
@@ -86,8 +101,9 @@ python mlb_daily_analysis.py --team Dodgers                # scope to one game, 
 - **Statcast is slow the first time.** `pybaseball` scrapes Baseball
   Savant; a batter's ~400-day pitch log can be tens of thousands of rows.
   `pyb.cache.enable()` is already on in the script, so repeat runs for the
-  same batter/date range are much faster. Consider `--no-statcast` for
-  quick iteration and only running the full Statcast pass once per day.
+  same batter/date range are much faster. Statcast is OFF by default now
+  anyway (see status note above) -- use `--use-statcast` deliberately, not
+  as your everyday default.
 - Pitch-type classification (`FF` vs `FT` vs `SI`, etc.) comes straight
   from Statcast's auto-classifier, which isn't perfect — the 3-bucket
   grouping (Fastball/Breaking/Offspeed) is deliberately coarse to reduce
@@ -104,7 +120,7 @@ python mlb_daily_analysis.py --team Dodgers                # scope to one game, 
 ## Backtesting (backtest.py)
 ```bash
 python backtest.py --start-date 2026-08-01 --end-date 2026-08-14
-python backtest.py --start-date 2026-08-01 --end-date 2026-08-14 --no-statcast   # faster first pass
+python backtest.py --start-date 2026-08-01 --end-date 2026-08-14                 # Statcast OFF by default
 python backtest.py --start-date 2026-08-01 --end-date 2026-08-14 --team Dodgers # scope to one team, fast test
 ```
 
@@ -134,9 +150,8 @@ That's a deliberate correctness-over-sample-size tradeoff — read as: the
 backtest numbers are a conservative lower bound on how the live model
 (with full current-season BvP) would likely perform.
 
-Recommended first run: `--no-statcast` on a 2-3 day window to confirm the
-plumbing and actual-results join work, before committing to a full 1-2
-week Statcast-enabled backtest.
+Recommended first run: a 2-3 day window (Statcast is OFF by default, so this
+is already fast) to confirm the plumbing and actual-results join work.
 
 ## Speed (--workers)
 Both scripts analyze batters concurrently now instead of one at a time --
@@ -181,9 +196,9 @@ formula, both evaluated on the same holdout dates. Only adopt a fit into
 train, and (b) has a reasonable holdout sample size -- the script flags
 tiers with fewer than 30 holdout rows as too thin to trust.
 
-Statcast-similar isn't fit (no data if your backtest used `--no-statcast`,
-which the wide one did) -- re-run a Statcast-enabled slice if you want that
-tier fit too.
+Statcast-similar isn't fit (no data since it's OFF by default now -- and per
+the status note above, it backtested as slightly worse than the fallback it
+would replace, so there's little reason to fit it as-is).
 
 ## Odds & Profitability (odds_value_finder.py)
 ```bash

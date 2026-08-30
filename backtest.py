@@ -37,7 +37,7 @@ LEAKAGE CONTROL (important):
 
 USAGE:
     python backtest.py --start-date 2026-08-01 --end-date 2026-08-14
-    python backtest.py --start-date 2026-08-01 --end-date 2026-08-14 --no-statcast
+    python backtest.py --start-date 2026-08-01 --end-date 2026-08-14 --use-statcast  # opt in, slower
     python backtest.py --start-date 2026-08-01 --end-date 2026-08-14 --team "Dodgers,Yankees"
 
 OUTPUT:
@@ -322,8 +322,11 @@ if __name__ == "__main__":
     parser.add_argument("--min-bvp-ab", type=int, default=8)
     parser.add_argument("--recent-days", type=int, default=15)
     parser.add_argument("--delay", type=float, default=0.15)
-    parser.add_argument("--no-statcast", action="store_true",
-                         help="Skip Statcast similarity (much faster, recommended for a first backtest pass)")
+    parser.add_argument("--use-statcast", action="store_true",
+                         help="Opt in to Statcast pitcher-similarity (OFF by default -- a head-to-head "
+                              "backtest, 2026-08-18 to 2026-08-24 n=1158, found it performs slightly worse "
+                              "than the simpler hand-split fallback on both Hits and Total Bases, and it's "
+                              "much slower. Kept as opt-in in case a stricter --similarity-threshold helps.)")
     parser.add_argument("--statcast-lookback-days", type=int, default=395)
     parser.add_argument("--similarity-threshold", type=float, default=0.85)
     parser.add_argument("--team", type=str, default=None,
@@ -338,7 +341,7 @@ if __name__ == "__main__":
 
     run_backtest(
         args.start_date, args.end_date,
-        use_statcast=not args.no_statcast,
+        use_statcast=args.use_statcast,
         min_bvp_ab=args.min_bvp_ab,
         recent_days=args.recent_days,
         statcast_lookback_days=args.statcast_lookback_days,

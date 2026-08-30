@@ -24,7 +24,7 @@ USAGE:
     python mlb_daily_analysis.py                     # today's games
     python mlb_daily_analysis.py --date 2026-08-22
     python mlb_daily_analysis.py --min-bvp-ab 8       # min ABs to trust BvP
-    python mlb_daily_analysis.py --no-statcast        # skip Statcast (faster)
+    python mlb_daily_analysis.py --use-statcast       # opt in to Statcast (slower, backtested as slightly worse)
     python mlb_daily_analysis.py --similarity-threshold 0.9
 
 OUTPUT:
@@ -891,7 +891,7 @@ def get_game_batting_actuals(game_pk):
 # Main
 # ---------------------------------------------------------------------------
 
-def analyze_date(date_str, min_bvp_ab=8, recent_days=15, delay=0.15, use_statcast=True,
+def analyze_date(date_str, min_bvp_ab=8, recent_days=15, delay=0.15, use_statcast=False,
                   statcast_lookback_days=395, similarity_threshold=0.85, team_filter=None,
                   bvp_seasons=None, final_games_only=False, verbose=True, workers=8):
     """
@@ -906,6 +906,15 @@ def analyze_date(date_str, min_bvp_ab=8, recent_days=15, delay=0.15, use_statcas
 
     `final_games_only`: if True, skips any game that isn't status "Final" --
     used by the backtester so it only scores games with real results.
+
+    `use_statcast`: OFF by default. A head-to-head backtest (2026-08-18 to
+    2026-08-24, n=1,158 matched player-dates) found the Statcast-similar-
+    pitcher tier performed slightly WORSE than the simpler hand-split
+    fallback on both Hits (r=0.374 vs 0.394) and Total Bases (r=0.296 vs
+    0.350) -- likely because the "similar pitcher" pool averaged 142
+    pitchers, far too broad to represent genuine repertoire similarity. The
+    code is kept (not deleted) in case a much stricter --similarity-threshold
+    is worth trying later, but it's opt-in, not the default path.
 
     `workers`: number of batter-analysis tasks to run concurrently. This is
     I/O-bound work (waiting on the MLB Stats API / Statcast), so threading
@@ -1171,8 +1180,10 @@ if __name__ == "__main__":
                          help="Number of batters to analyze concurrently (default: 8). Higher is "
                               "faster but hits the MLB Stats API harder. Statcast calls are capped "
                               "at min(workers, 4) internally regardless of this setting.")
-    parser.add_argument("--no-statcast", action="store_true",
-                         help="Skip Statcast pitcher-similarity analysis (much faster, uses hand-split fallback only)")
+    parser.add_argument("--use-statcast", action="store_true",
+                         help="Opt in to Statcast pitcher-similarity analysis (OFF by default -- a head-to-head "
+                              "backtest found it performs slightly worse than the simpler hand-split fallback, "
+                              "and it's much slower. See analyze_date()'s docstring for the numbers.")
     parser.add_argument("--statcast-lookback-days", type=int, default=395,
                          help="How far back to pull Statcast data for arsenal/history building (default: 395, ~current + prior season)")
     parser.add_argument("--similarity-threshold", type=float, default=0.85,
@@ -1186,7 +1197,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     run(args.date, args.min_bvp_ab, args.recent_days, args.delay,
-        use_statcast=not args.no_statcast,
+        use_statcast=args.use_statcast,
         statcast_lookback_days=args.statcast_lookback_days,
         similarity_threshold=args.similarity_threshold,
         team_filter=args.team,
