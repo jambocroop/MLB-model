@@ -55,7 +55,7 @@ import os
 from datetime import datetime
 
 from mlb_daily_analysis import analyze_date
-from odds_value_finder import poisson_prob_over, get_game_totals
+from odds_value_finder import poisson_prob_over, get_game_totals, calibrate_probability
 
 METRIC_FIELD = {"combined": "expected_combined", "total_bases": "expected_total_bases"}
 METRIC_LABEL = {"combined": "Hits+Runs+RBIs", "total_bases": "Total Bases"}
@@ -94,7 +94,16 @@ def compute_probabilities(rows, metrics, lines):
             if proj is None or proj == "":
                 continue
             line = lines[metric]
-            prob = poisson_prob_over(line, float(proj))
+            raw_prob = poisson_prob_over(line, float(proj))
+            # Empirical calibration correction (see odds_value_finder.py for the
+            # full writeup) -- the raw Poisson probability is overconfident at
+            # the high end, exactly where squad-building selects from. NOTE:
+            # this curve was measured at a 1.5 line specifically; it's applied
+            # here regardless of the actual --line used as a reasonable
+            # approximation (the overconfidence pattern is a general property
+            # of the Poisson tail, not purely a 1.5-specific artifact), but a
+            # different line (e.g. 2.5) hasn't been separately validated.
+            prob = calibrate_probability(raw_prob, metric)
             scored.append({
                 "batter": r["batter"], "team": r["team"], "game": r.get("game", ""),
                 "opp_pitcher": r.get("opp_pitcher", ""), "metric": metric, "line": line,

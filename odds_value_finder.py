@@ -81,6 +81,14 @@ MARKET_TO_MODEL_FIELD = {
     "batter_hits_runs_rbis": ("expected_combined", "poisson"),
 }
 
+# Which markets have an empirical calibration curve available (see
+# calibrate_probability() below). Only Combined and Total Bases have been
+# backtested for this -- others pass through uncalibrated.
+MARKET_TO_CALIBRATION_METRIC = {
+    "batter_total_bases": "total_bases",
+    "batter_hits_runs_rbis": "combined",
+}
+
 
 # ---------------------------------------------------------------------------
 # Probability math
@@ -122,6 +130,68 @@ def model_prob_over(field_value, model_type, line, ab_per_game=None, hit_compone
             return binomial_prob_over(line, ab_per_game, p)
         return poisson_prob_over(line, field_value)
     raise ValueError(f"Unknown model_type {model_type}")
+
+
+# ---------------------------------------------------------------------------
+# Empirical probability calibration
+# ---------------------------------------------------------------------------
+#
+# The raw Poisson-derived probability above is well-calibrated in the low-
+# middle range but systematically OVERCONFIDENT at high probabilities --
+# found by backtesting (2026-07-16 to 2026-08-25, n=9,792 candidates per
+# metric): binning every candidate by predicted P(clear) and comparing
+# against the ACTUAL clear rate in each bin showed the gap growing from
+# near-zero around the 30th percentile to +14.6% (Combined) / +19.1%
+# (Total Bases) overconfident at the top decile. This matters a lot in
+# practice: both squad_builder.py (picks the top-N by probability each day)
+# and odds_value_finder.py's value-bet detection (flags picks where model
+# probability notably exceeds market) specifically select from this
+# high-probability tail -- so both were showing inflated confidence exactly
+# where it's most consequential. A direct simulation of squad_builder's
+# actual top-4-per-day squads found the effect concretely: 92.8% average
+# predicted joint-contributing probability vs 72.6% actual clear rate for
+# those specific selected picks.
+#
+# Each entry is (avg_predicted_prob, actual_clear_rate) from one bin of the
+# empirical calibration curve, sorted ascending. Only covers "combined" and
+# "total_bases" (the two metrics squad_builder/value-bet detection actually
+# use) -- Hits/Runs/RBI individual markets aren't calibrated here since we
+# don't have that data; calibrate_probability() passes those through
+# unchanged. Re-derive this curve periodically from a fresh backtest.
+CALIBRATION_CURVE = {
+    "combined": [
+        (0.112, 0.223), (0.239, 0.254), (0.320, 0.317), (0.386, 0.335), (0.446, 0.369),
+        (0.504, 0.427), (0.559, 0.459), (0.619, 0.533), (0.694, 0.558), (0.815, 0.670),
+    ],
+    "total_bases": [
+        (0.061, 0.155), (0.152, 0.155), (0.213, 0.190), (0.265, 0.221), (0.319, 0.254),
+        (0.375, 0.290), (0.438, 0.353), (0.513, 0.429), (0.612, 0.526), (0.792, 0.601),
+    ],
+}
+
+
+def calibrate_probability(raw_prob, metric):
+    """
+    Corrects a raw model probability using the empirical calibration curve
+    above (linear interpolation between observed bin points; clamped to the
+    boundary bin's actual rate outside the observed range rather than
+    extrapolating). If `metric` isn't in CALIBRATION_CURVE (e.g. individual
+    Hits/Runs/RBI markets), returns raw_prob unchanged.
+    """
+    curve = CALIBRATION_CURVE.get(metric)
+    if not curve:
+        return raw_prob
+    if raw_prob <= curve[0][0]:
+        return curve[0][1]
+    if raw_prob >= curve[-1][0]:
+        return curve[-1][1]
+    for i in range(len(curve) - 1):
+        x0, y0 = curve[i]
+        x1, y1 = curve[i + 1]
+        if x0 <= raw_prob <= x1:
+            frac = (raw_prob - x0) / (x1 - x0) if x1 != x0 else 0.0
+            return y0 + frac * (y1 - y0)
+    return raw_prob  # unreachable given the boundary checks above
 
 
 # ---------------------------------------------------------------------------
@@ -345,6 +415,7 @@ def find_value_bets(model_rows, api_key, markets, min_edge=0.05):
                         ab_per_game = row["recent_ab"] / row["recent_games"]
 
                     m_prob = model_prob_over(row[field_name], model_type, line, ab_per_game=ab_per_game)
+                    m_prob = calibrate_probability(m_prob, MARKET_TO_CALIBRATION_METRIC.get(market_key))
 
                     over_price = sides.get("Over")
                     under_price = sides.get("Under")

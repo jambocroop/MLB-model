@@ -200,6 +200,32 @@ Statcast-similar isn't fit (no data since it's OFF by default now -- and per
 the status note above, it backtested as slightly worse than the fallback it
 would replace, so there's little reason to fit it as-is).
 
+## Probability calibration (shared by odds_value_finder.py and squad_builder.py)
+Backtesting `squad_builder.py` itself (not just the underlying projections)
+found a serious problem: simulating its actual top-4-per-day squad selection
+against real historical outcomes showed **74.6-76.9% average predicted joint
+probability vs only 36.6% actual rate all 4 picks cleared** -- roughly double
+the real number. Root cause: both squad-building and value-bet detection
+specifically select from the highest-probability tail each day (top-N by
+probability, or "model beats market"), and the raw Poisson-derived
+probability is well-calibrated in the middle of its range but increasingly
+OVERCONFIDENT at the top decile (+14.6% for Combined, +19.1% for Total Bases,
+measured by binning ~9,800 candidates by predicted probability and comparing
+against actual clear rate per bin) -- a classic selection-effect / "winner's
+curse" pattern.
+
+Fixed with an empirical calibration curve (`calibrate_probability()` in
+`odds_value_finder.py`, used by both tools) that corrects any raw
+Combined/Total-Bases probability against the real observed rate instead of
+trusting the raw Poisson output. Re-validated by re-simulating the exact
+same historical squads with calibration applied: predicted probability
+dropped to 20.0-20.8%, actual stayed at 17.1% -- gap closed from ~38-40
+points down to 3.7. Only Combined and Total Bases are calibrated (that's
+the data we have); individual Hits/Runs/RBI markets pass through unchanged.
+Re-derive this curve periodically from a fresh backtest -- it isn't permanent,
+and it was measured specifically at a 1.5 line (applied to other lines as a
+reasonable approximation, not separately validated).
+
 ## Odds & Profitability (odds_value_finder.py)
 ```bash
 export ODDS_API_KEY=your_key_here    # free key: https://the-odds-api.com/
