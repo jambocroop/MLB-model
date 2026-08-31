@@ -70,32 +70,89 @@ RECENT_FORM_DAYS = 30         # starters pitch every ~5 days; 30 days ~ 5-6 star
 # Data fetching
 # ---------------------------------------------------------------------------
 
+def _aggregate_starts_only(pitcher_id, season, date_from=None, date_to=None):
+    """
+    Shared helper: aggregates K/IP/games from a pitcher's game log, filtered
+    to appearances that were ACTUAL STARTS ONLY (stat.gamesStarted == 1 for
+    that specific game). Optionally bounded to a date range.
+
+    This replaces a real bug found via backtesting: dividing total SEASON
+    innings pitched (which can include relief appearances) by total starts
+    produces nonsensical numbers for anyone with a mixed starter/reliever
+    role -- e.g. a full-time reliever who made one "opener" start showed a
+    season IP/start of 39.0, because 29 innings accumulated across dozens of
+    short relief outings got divided by a start-count of 1. Filtering to
+    starts-only game log entries avoids this entirely: only the innings
+    actually pitched IN starts get counted, divided by the number of starts.
+    """
+    data = api_get(
+        f"{BASE}/people/{pitcher_id}/stats",
+        params={"stats": "gameLog", "season": season, "group": "pitching", "sportId": 1},
+    )
+    if not data:
+        return None
+    try:
+        splits = data["stats"][0]["splits"]
+    except (KeyError, IndexError, TypeError):
+        return None
+
+    total_k, total_ip, total_bf, total_games = 0, 0.0, 0, 0
+    for split in splits:
+        game_date = split.get("date")
+        if date_from and game_date and game_date < date_from:
+            continue
+        if date_to and game_date and game_date > date_to:
+            continue
+        stat = split.get("stat", {})
+        is_start = stat.get("gamesStarted")
+        if is_start not in (1, "1", True):
+            continue  # skip relief appearances -- only count actual starts
+        total_k += int(stat.get("strikeOuts", 0) or 0)
+        total_ip += _parse_innings(stat.get("inningsPitched", "0.0"))
+        total_bf += int(stat.get("battersFaced", 0) or 0)
+        total_games += 1
+
+    if total_games == 0:
+        return None
+    return {
+        "strikeouts": total_k, "innings_pitched": total_ip,
+        "games_started": total_games, "batters_faced": total_bf, "era": None,
+    }
+
+
 def get_pitcher_recent_form(pitcher_id, end_date, days=RECENT_FORM_DAYS):
     """
-    Pitcher's own recent starts, ending the day BEFORE end_date (same
-    leakage-avoidance fix as the batter model's get_recent_form -- see that
-    function's docstring for why this matters, especially for backtesting).
+    Pitcher's own recent STARTS ONLY, ending the day BEFORE end_date (same
+    leakage-avoidance fix as the batter model's get_recent_form). Uses the
+    starts-only game log filter -- see _aggregate_starts_only's docstring
+    for why that matters (a real bug found via backtesting).
     """
     window_end = (datetime.strptime(end_date, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
     start_date = (datetime.strptime(end_date, "%Y-%m-%d") - timedelta(days=days)).strftime("%Y-%m-%d")
-    data = api_get(
-        f"{BASE}/people/{pitcher_id}/stats",
-        params={
-            "stats": "byDateRange", "startDate": start_date, "endDate": window_end,
-            "group": "pitching", "sportId": 1,
-        },
-    )
-    return _extract_pitching_split(data)
+    season = int(end_date[:4])
+    # A recent window can span a year boundary (e.g. early January); check both
+    # seasons if needed rather than assuming the window is within one season.
+    prev_season = int(start_date[:4])
+    result = _aggregate_starts_only(pitcher_id, season, date_from=start_date, date_to=window_end)
+    if prev_season != season:
+        prior = _aggregate_starts_only(pitcher_id, prev_season, date_from=start_date, date_to=window_end)
+        if prior and result:
+            result = {
+                "strikeouts": result["strikeouts"] + prior["strikeouts"],
+                "innings_pitched": result["innings_pitched"] + prior["innings_pitched"],
+                "games_started": result["games_started"] + prior["games_started"],
+                "batters_faced": result["batters_faced"] + prior["batters_faced"],
+                "era": None,
+            }
+        elif prior:
+            result = prior
+    return result
 
 
 def get_pitcher_season_form(pitcher_id, season):
-    """Season-long pitching line -- used as the workload-management baseline
-    (what's this pitcher's NORMAL innings-per-start, to compare recent trend against)."""
-    data = api_get(
-        f"{BASE}/people/{pitcher_id}/stats",
-        params={"stats": "season", "season": season, "group": "pitching", "sportId": 1},
-    )
-    return _extract_pitching_split(data)
+    """Season-long STARTS-ONLY pitching line -- used as the workload-management
+    baseline. See _aggregate_starts_only's docstring for the bug this avoids."""
+    return _aggregate_starts_only(pitcher_id, season)
 
 
 def get_pitcher_vs_team(pitcher_id, team_id, current_season, seasons=None):
@@ -137,6 +194,9 @@ def get_pitcher_vs_team(pitcher_id, team_id, current_season, seasons=None):
             if opponent.get("id") != team_id:
                 continue
             stat = split.get("stat", {})
+            if stat.get("gamesStarted") not in (1, "1", True):
+                continue  # skip relief appearances against this opponent -- same fix
+                          # applied to get_pitcher_recent_form/get_pitcher_season_form
             total_k += int(stat.get("strikeOuts", 0) or 0)
             total_ip += _parse_innings(stat.get("inningsPitched", "0.0"))
             total_bf += int(stat.get("battersFaced", 0) or 0)
