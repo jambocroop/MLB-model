@@ -152,12 +152,20 @@ def model_prob_over(field_value, model_type, line, ab_per_game=None, hit_compone
 # predicted joint-contributing probability vs 72.6% actual clear rate for
 # those specific selected picks.
 #
+# "strikeouts" (pitcher strikeouts, measured at a 5.5 line) shows the SAME
+# top-tail overconfidence pattern (+16.5% at the 8th decile), plus a notable
+# UNDERconfidence at the very bottom (predicted 0.4% vs actual 10.1% in the
+# lowest bin) that the batter metrics didn't show as strongly. Measured from
+# a smaller sample (2026-06-01 to 2026-06-30, n=790, ~79 per bin vs ~980 for
+# the batter metrics) -- this curve is noisier and should be re-derived from
+# a larger sample when available.
+#
 # Each entry is (avg_predicted_prob, actual_clear_rate) from one bin of the
-# empirical calibration curve, sorted ascending. Only covers "combined" and
-# "total_bases" (the two metrics squad_builder/value-bet detection actually
-# use) -- Hits/Runs/RBI individual markets aren't calibrated here since we
-# don't have that data; calibrate_probability() passes those through
-# unchanged. Re-derive this curve periodically from a fresh backtest.
+# empirical calibration curve, sorted ascending. Only covers "combined",
+# "total_bases", and "strikeouts" -- Hits/Runs/RBI individual markets aren't
+# calibrated here since we don't have that data; calibrate_probability()
+# passes those through unchanged. Re-derive these curves periodically from a
+# fresh backtest.
 CALIBRATION_CURVE = {
     "combined": [
         (0.112, 0.223), (0.239, 0.254), (0.320, 0.317), (0.386, 0.335), (0.446, 0.369),
@@ -166,6 +174,10 @@ CALIBRATION_CURVE = {
     "total_bases": [
         (0.061, 0.155), (0.152, 0.155), (0.213, 0.190), (0.265, 0.221), (0.319, 0.254),
         (0.375, 0.290), (0.438, 0.353), (0.513, 0.429), (0.612, 0.526), (0.792, 0.601),
+    ],
+    "strikeouts": [
+        (0.004, 0.101), (0.081, 0.101), (0.164, 0.253), (0.244, 0.316), (0.314, 0.304),
+        (0.380, 0.392), (0.453, 0.443), (0.536, 0.481), (0.621, 0.456), (0.773, 0.620),
     ],
 }
 

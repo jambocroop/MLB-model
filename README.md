@@ -321,3 +321,20 @@ number** — it's a product of individual probabilities assuming independence,
 which understates same-game correlation (both the extra risk and the extra
 upside). Use it to compare candidate squads against each other, not as a
 precise number on its own.
+
+## Pitcher strikeouts integrated into Squad Builder
+`squad_builder.py --metric all` now mixes Combined, Total Bases, AND Pitcher
+Strikeouts picks in one pool (`--metric strikeouts` for strikeouts alone,
+`--metric both` keeps the old batter-only default). Strikeouts draws from a
+different underlying model (`pitcher_strikeouts.py`) than the batter props --
+`load_rows()` only fetches each data source when actually needed. The
+strikeouts probability gets the same empirical calibration correction as
+Combined/Total Bases (see the `CALIBRATION_CURVE["strikeouts"]` entry in
+`odds_value_finder.py`) -- built and applied BEFORE integration, not after,
+learning from the batter-model sequence where an uncalibrated probability
+briefly made it into live squad-building before the problem was caught.
+
+```bash
+python squad_builder.py --date 2026-08-26 --metric all
+python squad_builder.py --date 2026-08-26 --metric strikeouts --strikeouts-line 5.5
+```

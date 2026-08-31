@@ -54,59 +54,102 @@ import math
 import os
 from datetime import datetime
 
-from mlb_daily_analysis import analyze_date
+from mlb_daily_analysis import analyze_date as analyze_date_batters
+from pitcher_strikeouts import analyze_date as analyze_date_pitchers
 from odds_value_finder import poisson_prob_over, get_game_totals, calibrate_probability
 
-METRIC_FIELD = {"combined": "expected_combined", "total_bases": "expected_total_bases"}
-METRIC_LABEL = {"combined": "Hits+Runs+RBIs", "total_bases": "Total Bases"}
+METRIC_FIELD = {
+    "combined": "expected_combined",
+    "total_bases": "expected_total_bases",
+    "strikeouts": "expected_strikeouts",
+}
+METRIC_LABEL = {
+    "combined": "Hits+Runs+RBIs",
+    "total_bases": "Total Bases",
+    "strikeouts": "Pitcher Strikeouts",
+}
+# Which "kind" of row each metric draws from (batter model vs pitcher model --
+# two different data sources), and the name-field each kind's raw rows use.
+# Internally, every PICK in this tool's candidate pool is stored under a
+# generic "batter" key regardless of whether it's actually a batter or a
+# pitcher -- this keeps all the existing squad-building/exclusion/printing
+# logic working unchanged for both kinds of picks without a larger refactor.
+METRIC_ROW_KIND = {"combined": "batter", "total_bases": "batter", "strikeouts": "pitcher"}
+ROW_NAME_FIELD = {"batter": "batter", "pitcher": "pitcher"}
 
 
-def load_rows(date_str, team_filter, csv_path):
+def load_rows(date_str, team_filter, csv_path, metrics):
+    """
+    Returns {"batter": [...], "pitcher": [...]}, only fetching the row kinds
+    actually needed for the requested metrics -- a combined/total_bases-only
+    run doesn't pay for a pitcher-model fetch it won't use, and vice versa.
+    """
+    needed_kinds = set(METRIC_ROW_KIND[m] for m in metrics)
+    result = {"batter": [], "pitcher": []}
+
     if csv_path:
+        # CSV reuse supports one row kind per file -- detect which by schema.
         with open(csv_path, newline="") as f:
             rows = list(csv.DictReader(f))
+        if not rows:
+            return result
+        kind = "pitcher" if "expected_strikeouts" in rows[0] else "batter"
+        numeric_fields = (["expected_combined", "expected_total_bases"] if kind == "batter"
+                          else ["expected_strikeouts", "expected_innings", "k_per_ip"])
         for r in rows:
-            for key in ("expected_combined", "expected_total_bases"):
+            for key in numeric_fields:
                 if r.get(key) not in (None, ""):
                     r[key] = float(r[key])
-        return rows
-    rows, _ = analyze_date(date_str, team_filter=team_filter, use_statcast=False, workers=8)
-    return rows
+        result[kind] = rows
+        return result
+
+    if "batter" in needed_kinds:
+        rows, _ = analyze_date_batters(date_str, team_filter=team_filter, use_statcast=False, workers=8)
+        result["batter"] = rows
+    if "pitcher" in needed_kinds:
+        result["pitcher"] = analyze_date_pitchers(date_str, team_filter=team_filter, verbose=False)
+    return result
 
 
-def compute_probabilities(rows, metrics, lines):
+def compute_probabilities(rows_by_kind, metrics, lines):
     """
     Builds the PICK POOL, not a player list: each row can contribute up to one
-    entry PER METRIC requested (Combined and/or Total Bases), each with its own
-    line and probability. The same real player legitimately produces two
-    separate entries (one per metric) -- that's intended, since a squad "pick"
-    here really means (player, stat, line), and the same player can fill two
-    different slots via two different stats.
+    entry PER METRIC requested (Combined, Total Bases, and/or Strikeouts),
+    each with its own line and probability. The same real player legitimately
+    produces multiple entries (one per applicable metric) -- that's intended,
+    since a squad "pick" here really means (player, stat, line), and the same
+    player can fill multiple slots via different stats. Strikeouts draws from
+    a different underlying model (pitcher_strikeouts.py) than Combined/Total
+    Bases (mlb_daily_analysis.py) -- rows_by_kind keeps them separate until
+    they're merged into one combined pick pool here.
 
-    metrics: list of metric keys to include, e.g. ["combined", "total_bases"]
+    rows_by_kind: {"batter": [...], "pitcher": [...]}, from load_rows()
+    metrics: list of metric keys to include, e.g. ["combined", "total_bases", "strikeouts"]
     lines: dict {metric: line}
     """
     scored = []
-    for r in rows:
-        for metric in metrics:
-            field = METRIC_FIELD[metric]
+    for metric in metrics:
+        kind = METRIC_ROW_KIND[metric]
+        name_field = ROW_NAME_FIELD[kind]
+        field = METRIC_FIELD[metric]
+        line = lines[metric]
+        for r in rows_by_kind[kind]:
             proj = r.get(field)
             if proj is None or proj == "":
                 continue
-            line = lines[metric]
             raw_prob = poisson_prob_over(line, float(proj))
             # Empirical calibration correction (see odds_value_finder.py for the
             # full writeup) -- the raw Poisson probability is overconfident at
-            # the high end, exactly where squad-building selects from. NOTE:
-            # this curve was measured at a 1.5 line specifically; it's applied
-            # here regardless of the actual --line used as a reasonable
-            # approximation (the overconfidence pattern is a general property
-            # of the Poisson tail, not purely a 1.5-specific artifact), but a
-            # different line (e.g. 2.5) hasn't been separately validated.
+            # the high end for every metric checked so far, exactly where
+            # squad-building selects from. NOTE: each curve was measured at one
+            # specific line (1.5 for Combined/Total Bases, 5.5 for Strikeouts);
+            # applied here regardless of the actual --line used as a reasonable
+            # approximation, not separately validated per line.
             prob = calibrate_probability(raw_prob, metric)
             scored.append({
-                "batter": r["batter"], "team": r["team"], "game": r.get("game", ""),
-                "opp_pitcher": r.get("opp_pitcher", ""), "metric": metric, "line": line,
+                "batter": r[name_field], "team": r["team"], "game": r.get("game", ""),
+                "opp_pitcher": r.get("opp_pitcher", r.get("opp_team", "")),
+                "metric": metric, "line": line,
                 "projection": float(proj), "prob": prob, "note": r.get("note", ""),
             })
     scored.sort(key=lambda x: -x["prob"])
@@ -334,8 +377,8 @@ def print_squad(squad, label, squad_size):
 
 
 def main(date_str, team_filter, csv_path, metrics, lines, squad_size, num_alternatives, max_per_game, api_key):
-    rows = load_rows(date_str, team_filter, csv_path)
-    if not rows:
+    rows = load_rows(date_str, team_filter, csv_path, metrics)
+    if not rows["batter"] and not rows["pitcher"]:
         print("No model rows available.")
         return
 
@@ -413,14 +456,22 @@ if __name__ == "__main__":
                      "player can fill two slots if both his picks rank highly, that's intended.")
     parser.add_argument("--date", default=datetime.now().strftime("%Y-%m-%d"))
     parser.add_argument("--team", default=None, help="Scope to specific teams, comma-separated")
-    parser.add_argument("--csv", default=None, help="Reuse an existing mlb_report_*.csv instead of recomputing")
-    parser.add_argument("--metric", choices=["combined", "total_bases", "both"], default="both",
-                         help="Which stat(s) to pull picks from (default: both, mixed in one pool)")
+    parser.add_argument("--csv", default=None, help="Reuse an existing mlb_report_*.csv or "
+                         "pitcher_strikeouts_*.csv instead of recomputing (one row-kind per file)")
+    parser.add_argument("--metric", choices=["combined", "total_bases", "strikeouts", "both", "all"],
+                         default="both",
+                         help="Which stat(s) to pull picks from. 'both' = combined+total_bases "
+                              "(default, batter-only). 'all' = combined+total_bases+strikeouts "
+                              "(mixes in pitcher strikeouts too). All picks land in one mixed pool.")
     parser.add_argument("--line", type=float, default=None,
-                         help="Line to use for BOTH metrics if they should share one (e.g. --line 1.5). "
-                              "For different lines per metric, use --combined-line / --total-bases-line instead.")
+                         help="Line to use for ALL requested metrics if they should share one (e.g. --line 1.5). "
+                              "For different lines per metric, use --combined-line / --total-bases-line / "
+                              "--strikeouts-line instead.")
     parser.add_argument("--combined-line", type=float, default=1.5, help="Line for Hits+Runs+RBIs (default 1.5)")
     parser.add_argument("--total-bases-line", type=float, default=1.5, help="Line for Total Bases (default 1.5)")
+    parser.add_argument("--strikeouts-line", type=float, default=5.5,
+                         help="Line for Pitcher Strikeouts (default 5.5, a common real prop line -- "
+                              "also what the calibration curve was measured at)")
     parser.add_argument("--squad-size", type=int, default=4)
     parser.add_argument("--num-alternatives", type=int, default=3)
     parser.add_argument("--max-per-game", type=int, default=2,
@@ -431,11 +482,18 @@ if __name__ == "__main__":
                               "game-total-prioritized squad.")
     args = parser.parse_args()
 
-    metrics = ["combined", "total_bases"] if args.metric == "both" else [args.metric]
+    if args.metric == "both":
+        metrics = ["combined", "total_bases"]
+    elif args.metric == "all":
+        metrics = ["combined", "total_bases", "strikeouts"]
+    else:
+        metrics = [args.metric]
+
     if args.line is not None:
         lines = {m: args.line for m in metrics}
     else:
-        lines = {"combined": args.combined_line, "total_bases": args.total_bases_line}
+        lines = {"combined": args.combined_line, "total_bases": args.total_bases_line,
+                  "strikeouts": args.strikeouts_line}
 
     main(args.date, args.team, args.csv, metrics, lines, args.squad_size,
          args.num_alternatives, args.max_per_game if args.max_per_game > 0 else None, args.api_key)
