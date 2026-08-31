@@ -98,27 +98,56 @@ def get_pitcher_season_form(pitcher_id, season):
     return _extract_pitching_split(data)
 
 
-def get_pitcher_vs_team(pitcher_id, team_id, seasons=None):
+def get_pitcher_vs_team(pitcher_id, team_id, current_season, seasons=None):
     """
-    Pitcher's history against this specific opposing team. `seasons`, if
-    given (list of ints), restricts to those seasons only -- pass seasons
-    strictly before the target date's year for leak-free backtesting (same
-    pattern as the batter model's bvp_seasons).
+    Pitcher's history against this specific opposing team, built from his
+    individual game log entries filtered to games started against that team.
+
+    An earlier version used stats=vsTeam directly, which returned 0 BF for
+    EVERY pitcher tested (~15 pitchers, including several long-tenured
+    veterans certain to have faced these opponents many times) -- a uniform
+    zero across that many pitchers meant the parameter/endpoint combination
+    doesn't actually work for pitching stats, not that the samples were
+    genuinely all empty. Rewritten to use gameLog instead, a more
+    well-established endpoint (same reliability tier as byDateRange, which
+    already works correctly elsewhere in this project).
+
+    `seasons`: if given (list of ints), restricts to those seasons only --
+    pass seasons strictly before the target date's year for leak-free
+    backtesting (same pattern as the batter model's bvp_seasons). If not
+    given (live use), defaults to the current season + 2 prior seasons, for
+    a fuller sample than a single season alone would give.
     """
-    params = {
-        "stats": "vsTeam", "opposingTeamId": team_id, "group": "pitching", "sportId": 1,
+    seasons_to_check = seasons or [current_season, current_season - 1, current_season - 2]
+
+    total_k, total_ip, total_bf, total_games = 0, 0.0, 0, 0
+    for season in seasons_to_check:
+        data = api_get(
+            f"{BASE}/people/{pitcher_id}/stats",
+            params={"stats": "gameLog", "season": season, "group": "pitching", "sportId": 1},
+        )
+        if not data:
+            continue
+        try:
+            splits = data["stats"][0]["splits"]
+        except (KeyError, IndexError, TypeError):
+            continue
+        for split in splits:
+            opponent = split.get("opponent", {})
+            if opponent.get("id") != team_id:
+                continue
+            stat = split.get("stat", {})
+            total_k += int(stat.get("strikeOuts", 0) or 0)
+            total_ip += _parse_innings(stat.get("inningsPitched", "0.0"))
+            total_bf += int(stat.get("battersFaced", 0) or 0)
+            total_games += 1
+
+    if total_games == 0:
+        return None
+    return {
+        "strikeouts": total_k, "innings_pitched": total_ip,
+        "games_started": total_games, "batters_faced": total_bf, "era": None,
     }
-    if seasons:
-        splits = []
-        for season in seasons:
-            p = dict(params, season=season)
-            data = api_get(f"{BASE}/people/{pitcher_id}/stats", params=p)
-            s = _extract_pitching_split(data)
-            if s:
-                splits.append(s)
-        return _sum_pitching_splits(splits)
-    data = api_get(f"{BASE}/people/{pitcher_id}/stats", params=params)
-    return _extract_pitching_split(data)
 
 
 def get_team_k_rate(team_id, season):
@@ -317,7 +346,7 @@ def analyze_date(date_str, team_filter=None, min_vs_team_bf=MIN_VS_TEAM_BF,
 
             recent = get_pitcher_recent_form(pitcher_id, date_str)
             season_form = get_pitcher_season_form(pitcher_id, season)
-            vs_team = get_pitcher_vs_team(pitcher_id, opp_team_id, seasons=vs_team_seasons)
+            vs_team = get_pitcher_vs_team(pitcher_id, opp_team_id, season, seasons=vs_team_seasons)
             opp_k_rate = get_team_k_rate(opp_team_id, season if not vs_team_seasons else vs_team_seasons[0])
 
             scores = score_pitcher_strikeouts(vs_team, recent, season_form, min_vs_team_bf)
